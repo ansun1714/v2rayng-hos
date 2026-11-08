@@ -14,6 +14,14 @@ const TUN_DNS: string = '172.19.0.2';
 const TUN_PREFIX: number = 30;
 const TUN_MTU: number = 1400;
 
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve: () => void) => {
+    setTimeout(() => {
+      resolve();
+    }, ms);
+  });
+}
+
 /**
  * 对应 Android 版 v2rayNG 的 CoreVpnService：
  * 系统拉起扩展 -> 申请虚拟网卡拿 fd -> 把 fd 交给 Go 内核（mihomo）跑 gvisor 协议栈，
@@ -30,11 +38,14 @@ export default class VpnExtAbility extends VpnExtensionAbility {
 
   onCreate(want: Want): void {
     hilog.info(DOMAIN, TAG, 'VpnExtAbility onCreate');
+    FileStore.appendLog(this.context.filesDir, 'extension onCreate');
     this.startCore(want);
   }
 
   onDestroy(): void {
     hilog.info(DOMAIN, TAG, 'VpnExtAbility onDestroy');
+    const filesDir: string = this.context.filesDir;
+    FileStore.appendLog(filesDir, 'extension onDestroy');
     if (this.statsTimer >= 0) {
       clearInterval(this.statsTimer);
       this.statsTimer = -1;
@@ -44,21 +55,30 @@ export default class VpnExtAbility extends VpnExtensionAbility {
       this.delayTimer = -1;
     }
     this.started = false;
-    try {
-      NgCore.stop();
-    } catch (err) {
-      hilog.error(DOMAIN, TAG, 'stop core failed: %{public}s', String(err));
-    }
-    const conn = this.vpnConn;
-    if (conn !== undefined) {
-      conn.destroy().then(() => {
-        hilog.info(DOMAIN, TAG, 'vpn destroyed');
-      }).catch((err: Error) => {
-        hilog.error(DOMAIN, TAG, 'vpn destroy failed: %{public}s', err.message);
-      });
-      this.vpnConn = undefined;
-    }
+    // 先落盘「已断开」：NgCore.stop 可能阻塞，绝不能让状态文件停在 running=true，
+    // 否则界面会一直显示「已连接 / 停止代理」，点断开也无效。
     this.writeState(false, '已断开');
+    const conn = this.vpnConn;
+    this.vpnConn = undefined;
+    // 内核退出与通道销毁移到下一轮事件循环，避免 onDestroy 被卡住、销毁流程走不完
+    setTimeout(() => {
+      try {
+        NgCore.stop();
+        FileStore.appendLog(filesDir, 'core stopped');
+      } catch (err) {
+        hilog.error(DOMAIN, TAG, 'stop core failed: %{public}s', String(err));
+        FileStore.appendLog(filesDir, 'core stop failed: ' + String(err));
+      }
+      if (conn !== undefined) {
+        conn.destroy().then(() => {
+          hilog.info(DOMAIN, TAG, 'vpn destroyed');
+          FileStore.appendLog(filesDir, 'vpn destroyed');
+        }).catch((err: Error) => {
+          hilog.error(DOMAIN, TAG, 'vpn destroy failed: %{public}s', err.message);
+          FileStore.appendLog(filesDir, 'vpn destroy failed: ' + err.message);
+        });
+      }
+    }, 0);
   }
 
   private writeState(running: boolean, message: string): void {
@@ -104,18 +124,24 @@ export default class VpnExtAbility extends VpnExtensionAbility {
         fd = await conn.create(vpnConfig);
       } catch (createErr) {
         const be = createErr as BusinessError;
-        hilog.error(DOMAIN, TAG, 'create err code=%{public}d msg=%{public}s',
-          be.code !== undefined ? be.code : -1, String(be.message));
-        // 2203002：系统里已有 VPN。销毁残留后重试一次
+        const code: number = be.code !== undefined ? be.code : -1;
+        hilog.error(DOMAIN, TAG, 'create err code=%{public}d msg=%{public}s', code, String(be.message));
+        FileStore.appendLog(filesDir, 'create failed code=' + String(code) + ' msg=' + String(be.message));
+        // 2203002：系统里已有 VPN（上一轮扩展还没拆干净）。销毁残留、等系统释放后重试
         try {
           await conn.destroy();
+          FileStore.appendLog(filesDir, 'destroy stale conn');
         } catch (destroyErr) {
           const de = destroyErr as BusinessError;
           hilog.warn(DOMAIN, TAG, 'destroy before retry failed: %{public}s', String(de.message));
+          FileStore.appendLog(filesDir, 'destroy stale conn failed: ' + String(de.message));
         }
+        await delay(400);
         fd = await conn.create(vpnConfig);
+        FileStore.appendLog(filesDir, 'create retried fd=' + String(fd));
       }
       hilog.info(DOMAIN, TAG, 'tun fd = %{public}d', fd);
+      FileStore.appendLog(filesDir, 'tun fd=' + String(fd));
       hilog.info(DOMAIN, TAG, 'probe = %{public}s', NgCore.probeFd(fd));
 
       // 内核日志桥由 NAPI 在加载 libngcore.so 时自动挂上，日志标签 NG-CORE
@@ -149,12 +175,14 @@ export default class VpnExtAbility extends VpnExtensionAbility {
       const error: string = NgCore.start(config, FileStore.ensureDir(filesDir));
       if (error.length > 0) {
         hilog.error(DOMAIN, TAG, 'core start failed: %{public}s', error);
+        FileStore.appendLog(filesDir, 'core start failed: ' + error);
         this.writeState(false, '内核启动失败：' + error);
         return;
       }
 
       this.started = true;
       this.writeState(true, '已连接');
+      FileStore.appendLog(filesDir, 'core started, state=running');
       this.startStatsLoop(filesDir);
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'vpn create failed: %{public}s', String(err));
@@ -164,24 +192,43 @@ export default class VpnExtAbility extends VpnExtensionAbility {
 
   private async bindUnderlyingNetwork(): Promise<void> {
     try {
+      const filesDir: string = this.context.filesDir;
       const nets: connection.NetHandle[] = await connection.getAllNets();
+      let wifiNet: connection.NetHandle | undefined = undefined;
+      let cellNet: connection.NetHandle | undefined = undefined;
       for (let i = 0; i < nets.length; i++) {
         const net: connection.NetHandle = nets[i];
         const caps: connection.NetCapabilities = await connection.getNetCapabilities(net);
-        const isVpn: boolean = caps.bearerTypes.indexOf(connection.NetBearType.BEARER_VPN) >= 0;
+        const bearers: connection.NetBearType[] = caps.bearerTypes;
+        const isVpn: boolean = bearers !== undefined &&
+          bearers.indexOf(connection.NetBearType.BEARER_VPN) >= 0;
         const capsArr: connection.NetCap[] = caps.networkCap !== undefined ? caps.networkCap : [];
         const hasInternet: boolean =
           capsArr.indexOf(connection.NetCap.NET_CAPABILITY_INTERNET) >= 0;
         if (isVpn || !hasInternet) {
           continue;
         }
-        await connection.setAppNet(net);
-        hilog.info(DOMAIN, TAG, 'app net bound to %{public}d (wifi/cellular)', net.netId);
+        // 优先 WiFi：若绑到蜂窝，用户切到 WiFi 后内核仍走蜂窝，信号差时直接断流
+        if (bearers.indexOf(connection.NetBearType.BEARER_WIFI) >= 0 && wifiNet === undefined) {
+          wifiNet = net;
+        } else if (bearers.indexOf(connection.NetBearType.BEARER_CELLULAR) >= 0 &&
+          cellNet === undefined) {
+          cellNet = net;
+        }
+      }
+      const target: connection.NetHandle | undefined =
+        wifiNet !== undefined ? wifiNet : cellNet;
+      if (target === undefined) {
+        hilog.warn(DOMAIN, TAG, 'no underlying net found, keep default');
+        FileStore.appendLog(filesDir, 'no underlying net, keep default');
         return;
       }
-      hilog.warn(DOMAIN, TAG, 'no underlying net found, keep default');
+      await connection.setAppNet(target);
+      hilog.info(DOMAIN, TAG, 'app net bound to %{public}d (wifi/cellular)', target.netId);
+      FileStore.appendLog(filesDir, 'app net bound to ' + String(target.netId));
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'bind underlying net failed: %{public}s', String(err));
+      FileStore.appendLog(this.context.filesDir, 'bind net failed: ' + String(err));
     }
   }
 

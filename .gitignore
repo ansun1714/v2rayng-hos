@@ -18,6 +18,10 @@ app/entry/src/main/resources/rawfile/nodes.txt
 # geoip / geosite 数据（约 28MB，来自 Loyalsoldier/v2ray-rules-dat，按需下载）
 app/entry/src/main/resources/rawfile/geoip.dat
 app/entry/src/main/resources/rawfile/geosite.dat
+# 个人版专属背景图（只在本地构建里用，不进公开仓库）
+app/entry/src/main/resources/base/media/personal_bg.png
+app/entry/src/main/resources/base/media/personal_icon.png
+app/AppScope/resources/base/media/personal_icon.png
 
 # ── 运行时数据快照 ──────────────────────────────────────
 app/profiles.json
@@ -28,6 +32,9 @@ app/rules-src.txt
 # ── Go 内核编译中间产物 ─────────────────────────────────
 core-native/*.so
 core-native/*.bak
+
+# ── 本地参考用的上游源码（约 166MB，仅本机比对，不入库） ──
+/upstream/
 
 # ── 本机临时文件（调试脚本、截图、测试夹具、日志） ──────
 /_*

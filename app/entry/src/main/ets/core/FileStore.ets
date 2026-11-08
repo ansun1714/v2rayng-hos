@@ -47,6 +47,28 @@ export class FileStore {
     }
   }
 
+  /**
+   * 追加一行运行日志（vpn.log）。界面进程与扩展进程都会写同一个文件，
+   * 这里用「读旧 + 截断 + 重写」的方式，并保留最近 240 行，避免越写越大。
+   */
+  static appendLog(filesDir: string, line: string): void {
+    try {
+      const path: string = FileStore.ensureDir(filesDir) + '/vpn.log';
+      const old: string = FileStore.readText(path);
+      let lines: string[] = old.length > 0 ? old.split('\n') : [];
+      const now: Date = new Date();
+      const hh: string = String(now.getHours()).padStart(2, '0');
+      const mm: string = String(now.getMinutes()).padStart(2, '0');
+      const ss: string = String(now.getSeconds()).padStart(2, '0');
+      lines.push(hh + ':' + mm + ':' + ss + ' ' + line);
+      if (lines.length > 240) {
+        lines = lines.slice(lines.length - 240);
+      }
+      FileStore.writeText(path, lines.join('\n'));
+    } catch (err) {
+    }
+  }
+
   static profilesPath(filesDir: string): string {
     return FileStore.ensureDir(filesDir) + '/profiles.json';
   }

@@ -2,7 +2,7 @@ import { common, Want } from '@kit.AbilityKit';
 import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { vpnExtension, http } from '@kit.NetworkKit';
+import { vpnExtension, http, connection } from '@kit.NetworkKit';
 import { PromptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { ProxyLink } from '../core/ProxyLink';
@@ -24,11 +24,118 @@ class NodeGroup {
   indices: number[] = [];
 }
 
+/**
+ * 列表中的一行。LazyForEach 只按需创建可见的行，
+ * 所以这里把要显示的字段都拍平，渲染时不用再回头读 profiles。
+ */
+class NodeRow {
+  /** 0 分组头 / 1 节点 / 2「再显示」 */
+  kind: number = 0;
+  key: string = '';
+  groupKey: string = '';
+  groupTitle: string = '';
+  groupCount: number = 0;
+  groupOpen: boolean = false;
+  nodeIndex: number = -1;
+  name: string = '';
+  delay: number = -1;
+  addr: string = '';
+  selected: boolean = false;
+  moreLeft: number = 0;
+}
+
+/** LazyForEach 的数据源：整体换行数组后通知列表刷新。 */
+class NodeDataSource implements IDataSource {
+  private listeners: DataChangeListener[] = [];
+  private rows: NodeRow[] = [];
+
+  totalCount(): number {
+    return this.rows.length;
+  }
+
+  getData(index: number): NodeRow {
+    return this.rows[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) {
+      this.listeners.push(listener);
+    }
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    const at: number = this.listeners.indexOf(listener);
+    if (at >= 0) {
+      this.listeners.splice(at, 1);
+    }
+  }
+
+  setRows(rows: NodeRow[]): void {
+    this.rows = rows;
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataReloaded();
+    });
+  }
+
+  /** 只有某一行内容变了：精确通知，避免整表重建 */
+  notifyRowChange(index: number): void {
+    if (index < 0 || index >= this.rows.length) {
+      return;
+    }
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataChange(index);
+    });
+  }
+
+  /** 按节点下标找它所在的行号（-1 表示当前不可见或未展开） */
+  indexOfNode(nodeIndex: number): number {
+    for (let i = 0; i < this.rows.length; i++) {
+      if (this.rows[i].kind === 1 && this.rows[i].nodeIndex === nodeIndex) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * 改某一行的选中态：复制一份再替换，引用变了 LazyForEach 才认这是新数据，
+   * 只通知这一行，其它行完全不动。
+   */
+  markSelected(nodeIndex: number, flag: boolean): void {
+    const at: number = this.indexOfNode(nodeIndex);
+    if (at < 0) {
+      return;
+    }
+    const src: NodeRow = this.rows[at];
+    if (src.selected === flag) {
+      return;
+    }
+    const copy: NodeRow = new NodeRow();
+    copy.kind = src.kind;
+    copy.key = src.key;
+    copy.groupKey = src.groupKey;
+    copy.groupTitle = src.groupTitle;
+    copy.groupCount = src.groupCount;
+    copy.groupOpen = src.groupOpen;
+    copy.nodeIndex = src.nodeIndex;
+    copy.name = src.name;
+    copy.delay = src.delay;
+    copy.addr = src.addr;
+    copy.selected = flag;
+    copy.moreLeft = src.moreLeft;
+    this.rows[at] = copy;
+    this.listeners.forEach((listener: DataChangeListener) => {
+      listener.onDataChange(at);
+    });
+  }
+}
+
 @Entry
 @Component
 struct Index {
   @State profiles: Profile[] = [];
-  @State selected: number = -1;
+  /** 当前选中的节点下标。故意不用 @State：点选节点只改两行，不该触发整页重建。 */
+  private selected: number = -1;
   @State running: boolean = false;
   @State statusText: string = '未连接';
   @State trafficText: string = '';
@@ -36,12 +143,16 @@ struct Index {
   @State linkInput: string = '';
   @State subInput: string = '';
   @State testing: boolean = false;
+  /** 连接/断开进行中：按钮立刻给出反馈，避免「点了没反应」的错觉 */
+  @State busy: boolean = false;
   /** 测速进度：已测 / 待测 */
   @State testDone: number = 0;
   @State testTotal: number = 0;
   @State testInfo: string = '';
   /** 列表重建戳：分组 ForEach 的 key 靠它变化才会重新渲染 */
   @State stamp: number = 0;
+  /** 分组已展开的节点页数（每页 PAGE_SIZE 个），改变它触发列表重绘 */
+  @State pageSeq: number = 0;
   /** 分组折叠状态：显式展开 / 显式收起过的订阅 key */
   @State openedKeys: string[] = [];
   @State closedKeys: string[] = [];
@@ -81,15 +192,39 @@ struct Index {
 
   private filesDir: string = '';
   private pollTimer: number = -1;
+  /** 系统 VPN 存活校验（state.json 可能残留 running=true） */
+  private watchTimer: number = -1;
+  /** groupList 缓存：profiles 引用 + 排序开关 + 数据版本都不变时直接复用 */
+  private cacheProfiles: Profile[] | undefined = undefined;
+  private cacheSort: boolean = false;
+  private cacheGroups: NodeGroup[] = [];
+  /** 列表数据源：LazyForEach 按需渲染，几百个节点也只创建屏幕内的行 */
+  private dataSource: NodeDataSource = new NodeDataSource();
   /** 节点列表变动后的自动重连互斥，避免连续操作把连接状态搅乱 */
   private reconnecting: boolean = false;
+  /** 切换过程中又有新的选择，等这轮完成后再切一次 */
+  private pendingSwitch: boolean = false;
+  private switchTimer: number = -1;
+  /** 手动推进度提示的保护区：这段时间内不让 state.json 的旧文案把它盖掉 */
+  private statusManualUntil: number = 0;
+
+  /** 显示一条自己控制的进度文案，几秒内不被轮询覆盖 */
+  private setStatus(text: string): void {
+    this.statusText = text;
+    this.statusManualUntil = Date.now() + 5000;
+  }
   private toast: PromptAction = this.getUIContext().getPromptAction();
 
   aboutToAppear(): void {
     const context = getContext(this) as common.UIAbilityContext;
     this.filesDir = context.filesDir;
-    FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
+    // 只在状态文件不存在时初始化；已有状态交给 readState + verifyRunning 判断，
+    // 否则每次重新进入页面都会把上一轮的真实状态（可能是运行中）覆盖成「未连接」。
+    if (FileStore.readText(FileStore.statePath(this.filesDir)).length === 0) {
+      FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
+    }
     this.reload();
+    this.refreshRows();
     if (this.profiles.length === 0) {
       this.seedDefaultNodes();
     }
@@ -102,6 +237,11 @@ struct Index {
     this.pollTimer = setInterval(() => {
       this.readState();
     }, 1000);
+    // 系统 VPN 是否真的还在，3 秒校验一次：状态文件可能是扩展被强杀前的残留
+    this.watchTimer = setInterval(() => {
+      this.verifyRunning();
+    }, 3000);
+    this.verifyRunning();
   }
 
   aboutToDisappear(): void {
@@ -109,6 +249,46 @@ struct Index {
       clearInterval(this.pollTimer);
       this.pollTimer = -1;
     }
+    if (this.watchTimer >= 0) {
+      clearInterval(this.watchTimer);
+      this.watchTimer = -1;
+    }
+  }
+
+  /** 系统里当前是否真的有 VPN 通道（权威判断，优于状态文件里的 running 字段）。 */
+  async hasSystemVpn(): Promise<boolean> {
+    try {
+      const nets: connection.NetHandle[] = await connection.getAllNets();
+      for (let i = 0; i < nets.length; i++) {
+        const caps: connection.NetCapabilities = await connection.getNetCapabilities(nets[i]);
+        const bearers: connection.NetBearType[] = caps.bearerTypes;
+        if (bearers !== undefined && bearers.indexOf(connection.NetBearType.BEARER_VPN) >= 0) {
+          return true;
+        }
+      }
+    } catch (err) {
+      FileStore.appendLog(this.filesDir, 'getAllNets failed: ' + String(err));
+    }
+    return false;
+  }
+
+  /**
+   * 校准运行状态：扩展被系统杀掉（VPN 图标消失）时，state.json 往往还停在 running=true，
+   * 于是按钮一直显示「停止代理」、点也停不掉。这里以系统 VPN 是否存在为准把状态纠正回来。
+   */
+  async verifyRunning(): Promise<void> {
+    if (!this.running) {
+      return;
+    }
+    const alive: boolean = await this.hasSystemVpn();
+    if (alive) {
+      return;
+    }
+    FileStore.appendLog(this.filesDir, 'verify: no system vpn, force ui to disconnected');
+    this.running = false;
+    this.statusText = '未连接';
+    this.trafficText = '';
+    FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
   }
 
   // ---------- 数据 ----------
@@ -179,20 +359,29 @@ struct Index {
   readState(): void {
     const text: string = FileStore.readText(FileStore.statePath(this.filesDir));
     if (text.length === 0) {
-      this.running = false;
+      if (this.running) {
+        this.running = false;
+      }
       return;
     }
     try {
       const state = JSON.parse(text) as CoreState;
-      this.running = state.running;
-      this.statusText = state.message;
+      // 值没变就不赋值：每秒都写一遍 @State 会白白触发整页重绘（列表里有几百个节点）
+      if (this.running !== state.running) {
+        this.running = state.running;
+      }
+      if (this.statusText !== state.message && Date.now() > this.statusManualUntil) {
+        this.statusText = state.message;
+      }
       // 瞬时速率大部分时间是 0，显示累计流量对用户更有意义
+      let traffic: string = '';
       if (state.totalUp !== undefined && state.totalDown !== undefined) {
-        this.trafficText = '↑' + Index.human(state.totalUp) + '  ↓' + Index.human(state.totalDown);
+        traffic = '↑' + Index.human(state.totalUp) + '  ↓' + Index.human(state.totalDown);
       } else if (state.up !== undefined && state.down !== undefined) {
-        this.trafficText = '↑' + Index.human(state.up) + '  ↓' + Index.human(state.down);
-      } else {
-        this.trafficText = '';
+        traffic = '↑' + Index.human(state.up) + '  ↓' + Index.human(state.down);
+      }
+      if (this.trafficText !== traffic) {
+        this.trafficText = traffic;
       }
     } catch (err) {
     }
@@ -230,13 +419,98 @@ struct Index {
     this.bump();
   }
 
-  /** 触发列表重建（测速回填、选中变化等不走 saveAll 的场景）。 */
+  /** 数据变了：版本号 +1 让分组缓存失效，并重建列表数据源。 */
   bump(): void {
     this.stamp = this.stamp + 1;
+    this.refreshRows();
   }
 
-  /** 按 subId 归组：手动节点一组，每个订阅链接一组。 */
+  /**
+   * 点选节点：只改「旧选中」「新选中」两行并精确通知，
+   * 不重建行数组、不触发整页 build —— 这是切换节点手感的关键。
+   */
+  selectNode(nodeIndex: number): void {
+    if (nodeIndex === this.selected || nodeIndex < 0) {
+      return;
+    }
+    const prev: number = this.selected;
+    this.selected = nodeIndex;
+    this.dataSource.markSelected(prev, false);
+    this.dataSource.markSelected(nodeIndex, true);
+    // 已经连着的时候点了别的节点：直接切过去，别再让用户自己停一次开一次
+    if (this.reconnecting) {
+      // 正在切换：记一笔，这一轮 connect 会读最新的 selected
+      this.pendingSwitch = true;
+    } else if (this.running) {
+      this.switchToSelected();
+    }
+  }
+
+  /** 连点几下节点时不要每下都重连，停手 0.8 秒后再切到最终选中的那个 */
+  switchToSelected(): void {
+    if (this.switchTimer >= 0) {
+      clearTimeout(this.switchTimer);
+    }
+    const name: string = this.selected >= 0 && this.selected < this.profiles.length ?
+      this.profiles[this.selected].name : '';
+    this.setStatus('准备切换到 ' + name);
+    this.switchTimer = setTimeout(() => {
+      this.switchTimer = -1;
+      this.reconnectSoon();
+    }, 800);
+  }
+
+  /** 按当前数据重建列表行：分组头 + 展开的节点（受分页限制）+「再显示」。 */
+  refreshRows(): void {
+    this.dataSource.setRows(this.buildRows());
+  }
+
+  buildRows(): NodeRow[] {
+    const rows: NodeRow[] = [];
+    const groups: NodeGroup[] = this.groupList();
+    groups.forEach((group: NodeGroup) => {
+      const head: NodeRow = new NodeRow();
+      head.kind = 0;
+      head.key = 'h:' + group.key;
+      head.groupKey = group.key;
+      head.groupTitle = group.title;
+      head.groupCount = group.indices.length;
+      head.groupOpen = this.groupOpen(group);
+      rows.push(head);
+      if (!head.groupOpen) {
+        return;
+      }
+      const limit: number = this.nodeLimit(group);
+      group.indices.slice(0, limit).forEach((index: number) => {
+        const p: Profile = this.profiles[index];
+        const row: NodeRow = new NodeRow();
+        row.kind = 1;
+        row.key = 'n:' + p.id;
+        row.groupKey = group.key;
+        row.nodeIndex = index;
+        row.name = p.name;
+        row.delay = p.delay;
+        row.addr = p.type.toUpperCase() + ' · ' + p.server + ':' + String(p.port);
+        row.selected = index === this.selected;
+        rows.push(row);
+      });
+      if (group.indices.length > limit) {
+        const more: NodeRow = new NodeRow();
+        more.kind = 2;
+        more.key = 'm:' + group.key;
+        more.groupKey = group.key;
+        more.moreLeft = group.indices.length - limit;
+        rows.push(more);
+      }
+    });
+    return rows;
+  }
+
+  /** 按 subId 归组：手动节点一组，每个订阅链接一组。结果按 profiles 引用缓存，避免每秒重绘都重算一遍。 */
   groupList(): NodeGroup[] {
+    if (this.cacheProfiles === this.profiles && this.cacheSort === this.sortByDelay) {
+      return this.cacheGroups;
+    }
     const manual: NodeGroup = new NodeGroup();
     manual.title = '手动节点';
     const byKey: Map<string, NodeGroup> = new Map<string, NodeGroup>();
@@ -266,6 +540,9 @@ struct Index {
       this.sortIndices(item);
       result.push(item);
     });
+    this.cacheProfiles = this.profiles;
+    this.cacheSort = this.sortByDelay;
+    this.cacheGroups = result;
     return result;
   }
 
@@ -275,13 +552,20 @@ struct Index {
       return;
     }
     const origin: number[] = group.indices.slice();
+    // 原位置查表：392 个节点时每次比较都做 indexOf 会把排序拖成 O(n² log n)
+    const pos: Map<number, number> = new Map<number, number>();
+    origin.forEach((value: number, at: number) => {
+      pos.set(value, at);
+    });
     group.indices.sort((a: number, b: number) => {
       const da: number = this.profiles[a].delay >= 0 ? this.profiles[a].delay : 999999;
       const db: number = this.profiles[b].delay >= 0 ? this.profiles[b].delay : 999999;
       if (da !== db) {
         return da - db;
       }
-      return origin.indexOf(a) - origin.indexOf(b);
+      const pa: number = pos.get(a) !== undefined ? pos.get(a) as number : 0;
+      const pb: number = pos.get(b) !== undefined ? pos.get(b) as number : 0;
+      return pa - pb;
     });
   }
 
@@ -303,6 +587,47 @@ struct Index {
       text = text.substring(0, 26) + '…';
     }
     return '订阅 · ' + text;
+  }
+
+  /** 每个分组默认只渲染 PAGE_SIZE 个节点，避免几百项一次性建出来卡住主线程。 */
+  static PAGE_SIZE: number = 80;
+
+  private groupPage: Map<string, number> = new Map<string, number>();
+
+  nodeLimit(group: NodeGroup): number {
+    const page: number | undefined = this.groupPage.get(group.key);
+    if (page !== undefined && page > 0) {
+      return page;
+    }
+    return Index.PAGE_SIZE;
+  }
+
+  moreNodes(key: string): void {
+    const group: NodeGroup | undefined = this.nodeGroupByKey(key);
+    if (group === undefined) {
+      return;
+    }
+    const current: number = this.nodeLimit(group);
+    this.groupPage.set(group.key, current + Index.PAGE_SIZE);
+    this.pageSeq = this.pageSeq + 1;
+    this.bump();
+  }
+
+  nodeGroupByKey(key: string): NodeGroup | undefined {
+    const groups: NodeGroup[] = this.groupList();
+    for (let i = 0; i < groups.length; i++) {
+      if (groups[i].key === key) {
+        return groups[i];
+      }
+    }
+    return undefined;
+  }
+
+  toggleKey(key: string): void {
+    const group: NodeGroup | undefined = this.nodeGroupByKey(key);
+    if (group !== undefined) {
+      this.toggleGroup(group);
+    }
   }
 
   /** 分组是否展开：手动组永远展开；订阅组超过 8 个节点时默认收起。 */
@@ -520,11 +845,15 @@ struct Index {
     this.testDone = 0;
     this.testTotal = group.indices.length;
     this.testInfo = '已测 0 · 待测 ' + String(this.testTotal);
+    // 测速过程中先不排序，否则每测出一个结果整组就跳一次，根本看不清
+    this.sortByDelay = false;
     this.bump();
     await this.runPool(group.indices, Index.TEST_CONCURRENCY);
     this.testing = false;
     this.testInfo = '';
     this.sortByDelay = true;
+    // 换一次引用：即使排序开关本来就是 true，也能让分组缓存失效、真正重排
+    this.profiles = this.profiles.slice();
     this.bump();
     this.toast.showToast({ message: '本组测速完成，已按延迟排序' });
   }
@@ -542,11 +871,14 @@ struct Index {
         if (at >= indices.length) {
           return;
         }
-        await this.testOne(indices[at]);
+        await this.testOne(indices[at], true);
         this.testDone = this.testDone + 1;
-        this.testInfo = '已测 ' + String(this.testDone) + ' · 待测 ' +
-          String(this.testTotal - this.testDone);
-        this.bump();
+        // 每 4 个节点统一刷新一次：bump 会重建列表行，让新的延迟值显示出来
+        if (this.testDone % 4 === 0 || this.testDone >= this.testTotal) {
+          this.testInfo = '已测 ' + String(this.testDone) + ' · 待测 ' +
+            String(this.testTotal - this.testDone);
+          this.bump();
+        }
       }
     };
     const workers: Promise<void>[] = [];
@@ -662,7 +994,7 @@ struct Index {
    * 测速：走内核 REST API，让内核真实经该节点请求一次 generate_204，返回毫秒。
    * 注意：必须先连接（内核起来后 9090 才有服务）。
    */
-  async testOne(index: number): Promise<void> {
+  async testOne(index: number, silent: boolean = false): Promise<void> {
     if (!this.running) {
       this.toast.showToast({ message: '请先连接，内核起来后才能测速' });
       return;
@@ -696,8 +1028,12 @@ struct Index {
     }
     FileStore.removeFile(reqFile);
     FileStore.removeFile(resFile);
+    // 回填延迟。批量测速时由 runPool 每几个节点统一刷新一次列表，
+    // 单点测速则立刻刷新。
     this.profiles[index].delay = delay;
-    this.profiles = this.profiles.slice();
+    if (!silent) {
+      this.bump();
+    }
   }
 
   static sleep(ms: number): Promise<void> {
@@ -727,6 +1063,7 @@ struct Index {
     this.testDone = 0;
     this.testTotal = this.profiles.length;
     this.testInfo = '已测 0 · 待测 ' + String(this.testTotal);
+    this.sortByDelay = false;
     this.bump();
     const all: number[] = [];
     for (let i = 0; i < this.profiles.length; i++) {
@@ -736,6 +1073,7 @@ struct Index {
     this.testing = false;
     this.testInfo = '';
     this.sortByDelay = true;
+    this.profiles = this.profiles.slice();
     this.bump();
     this.toast.showToast({ message: '测速完成，已按延迟排序' });
   }
@@ -1032,60 +1370,131 @@ struct Index {
 
   async connect(): Promise<void> {
     if (this.running) {
-      await this.disconnect();
+      // 断开：先给界面反馈，再等系统真拆干净
+      this.busy = true;
+      this.setStatus('正在断开…');
+      try {
+        await this.disconnect();
+      } finally {
+        this.busy = false;
+      }
       return;
     }
     if (this.selected < 0 || this.selected >= this.profiles.length) {
       this.toast.showToast({ message: '请先选择一个节点' });
       return;
     }
+    this.busy = true;
+    this.setStatus('正在连接…');
     try {
+      // 系统里还挂着上一轮的 VPN（扩展被强杀后常见）时先清掉，
+      // 否则新实例 create 会撞 2203002「系统已有 VPN」。
+      if (await this.hasSystemVpn()) {
+        FileStore.appendLog(this.filesDir, 'connect: stale vpn found, stopping first');
+        await this.stopExtension();
+        await this.waitVpnGone(3000);
+      }
       const config: string = ConfigBuilder.build(this.profiles, this.selected, this.rules);
       FileStore.writeText(FileStore.configPath(this.filesDir), config);
       const want: Want = {
         bundleName: BUNDLE_NAME,
         abilityName: EXT_ABILITY
       };
+      FileStore.appendLog(this.filesDir, 'start vpn extension');
       await vpnExtension.startVpnExtensionAbility(want);
       this.statusText = '正在启动内核…';
     } catch (err) {
       const message: string = String(err);
+      FileStore.appendLog(this.filesDir, 'start vpn extension failed: ' + message);
       this.toast.showToast({ message: '启动失败：' + message });
       this.statusText = message;
+    } finally {
+      this.busy = false;
     }
   }
 
-  async disconnect(): Promise<void> {
+  /** 只发一次 stop 请求，不判断结果。 */
+  private async stopExtension(): Promise<boolean> {
     try {
       const want: Want = {
         bundleName: BUNDLE_NAME,
         abilityName: EXT_ABILITY
       };
       await vpnExtension.stopVpnExtensionAbility(want);
+      return true;
+    } catch (err) {
+      FileStore.appendLog(this.filesDir, 'stopVpnExtensionAbility failed: ' + String(err));
+      return false;
+    }
+  }
+
+  /** 轮询等待系统真的把 VPN 通道拆掉（扩展 onDestroy 是异步的，固定 sleep 不可靠）。 */
+  private async waitVpnGone(timeoutMs: number): Promise<boolean> {
+    const steps: number = Math.max(1, Math.floor(timeoutMs / 400));
+    for (let i = 0; i < steps; i++) {
+      if (!(await this.hasSystemVpn())) {
+        return true;
+      }
+      await Index.sleep(400);
+    }
+    return !(await this.hasSystemVpn());
+  }
+
+  /**
+   * 断开：发 stop -> 等系统拆掉通道 -> 以「系统是否还有 VPN」为准更新界面。
+   * 之前只发 stop 就把 running 置 false，或 stop 抛错就停在「停止代理」，
+   * 两种都会让界面和真实状态对不上（停不掉 / 假连接）。
+   */
+  async disconnect(): Promise<void> {
+    FileStore.appendLog(this.filesDir, 'disconnect requested');
+    let stopped: boolean = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (await this.stopExtension()) {
+        stopped = true;
+        break;
+      }
+      await Index.sleep(300);
+    }
+    await this.waitVpnGone(4000);
+    const stillThere: boolean = await this.hasSystemVpn();
+    if (!stillThere) {
       this.running = false;
       this.statusText = '未连接';
       this.trafficText = '';
-    } catch (err) {
-      this.toast.showToast({ message: '断开失败：' + String(err) });
+      FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
+      FileStore.appendLog(this.filesDir,
+        'disconnect done, stopped=' + String(stopped));
+      return;
     }
+    // 通道还在：说明确实没断开，保留「停止代理」让用户能再点一次
+    FileStore.appendLog(this.filesDir, 'disconnect incomplete, vpn still alive');
+    this.toast.showToast({ message: '断开未完成，请再点一次或重启应用' });
   }
 
   /**
    * 节点增删改后：内核只在启动时读一次配置，所以连接中改动要自动重连才生效。
+   * 必须先确认旧通道拆干净再拉起，否则新旧两个扩展同时活着会断流。
    */
   private reconnectSoon(): void {
-    if (!this.running || this.reconnecting) {
+    if (!this.running) {
+      return;
+    }
+    if (this.reconnecting) {
+      // 已经在切换了：记一下，等这一轮结束再用最新选中的节点切一次
+      this.pendingSwitch = true;
       return;
     }
     this.reconnecting = true;
-    this.statusText = '配置已变更，正在重连…';
+    this.setStatus('正在切换节点…');
     this.disconnect().then(() => {
-      return Index.sleep(1500);
+      return this.waitVpnGone(5000);
     }).then(() => {
       this.reconnecting = false;
+      this.pendingSwitch = false;
       return this.connect();
     }).catch(() => {
       this.reconnecting = false;
+      this.pendingSwitch = false;
     });
   }
 
@@ -1093,11 +1502,11 @@ struct Index {
   @Builder
   field(label: string, value: string, onChange: (v: string) => void) {
     Row({ space: 8 }) {
-      Text(label).fontSize(13).width(76).fontColor('#666666')
+      Text(label).fontSize(15).width(80).fontColor('#4A4A4A')
       TextInput({ text: value })
         .layoutWeight(1)
-        .height(38)
-        .fontSize(13)
+        .height(42)
+        .fontSize(15)
         .onChange((v: string) => {
           onChange(v);
         })
@@ -1107,8 +1516,8 @@ struct Index {
   @Builder
   chip(label: string, current: string, onTap: () => void) {
     Text(label)
-      .fontSize(13)
-      .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+      .fontSize(14)
+      .padding({ left: 13, right: 13, top: 8, bottom: 8 })
       .borderRadius(8)
       .backgroundColor(current === label ? '#EAF1FF' : '#F2F2F2')
       .fontColor(current === label ? '#0A59F7' : '#333333')
@@ -1124,7 +1533,7 @@ struct Index {
         Column({ space: 8 }) {
           this.field('名称', this.eName, (v: string) => { this.eName = v; })
           Row({ space: 8 }) {
-            Text('协议').fontSize(13).width(76).fontColor('#666666')
+            Text('协议').fontSize(15).width(80).fontColor('#4A4A4A')
             Row({ space: 8 }) {
               this.chip('vless', this.eType, () => { this.eType = 'vless'; })
               this.chip('vmess', this.eType, () => { this.eType = 'vmess'; })
@@ -1146,7 +1555,7 @@ struct Index {
           }
 
           Row({ space: 8 }) {
-            Text('传输').fontSize(13).width(76).fontColor('#666666')
+            Text('传输').fontSize(15).width(80).fontColor('#4A4A4A')
             Row({ space: 8 }) {
               this.chip('tcp', this.eNetwork, () => { this.eNetwork = 'tcp'; })
               this.chip('ws', this.eNetwork, () => { this.eNetwork = 'ws'; })
@@ -1155,7 +1564,7 @@ struct Index {
           }.width('100%')
 
           Row({ space: 8 }) {
-            Text('TLS').fontSize(13).width(76).fontColor('#666666')
+            Text('TLS').fontSize(15).width(80).fontColor('#4A4A4A')
             Toggle({ type: ToggleType.Switch, isOn: this.eTls })
               .onChange((on: boolean) => {
                 this.eTls = on;
@@ -1193,81 +1602,138 @@ struct Index {
     .alignItems(HorizontalAlign.Start)
   }
 
+  // 左滑露出的操作：编辑 / 删除；平时不占位，避免点选节点时误触
   @Builder
-  groupHeader(group: NodeGroup) {
-    Row({ space: 10 }) {
-      Text(group.key.length > 0 ? (this.groupOpen(group) ? '▾ ' : '▸ ') + group.title : group.title)
-        .fontSize(12)
-        .fontColor('#8A8A8A')
-        .layoutWeight(1)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .onClick(() => {
-          this.toggleGroup(group);
-        })
-      Text(String(group.indices.length) + ' 个')
-        .fontSize(11)
-        .fontColor('#B0B0B0')
-        .onClick(() => {
-          this.toggleGroup(group);
-        })
-      if (group.key.length > 0) {
-        Text('更新').fontSize(12).fontColor('#0A59F7')
-          .onClick(() => {
-            this.refreshGroup(group.key);
-          })
-      }
-      Text('测速').fontSize(12).fontColor('#0A59F7')
-        .onClick(() => {
-          this.testGroup(group);
-        })
-    }
-    .width('100%')
-    .padding({ left: 4, right: 4, top: 4, bottom: 2 })
-  }
-
-  @Builder
-  nodeRow(index: number) {
-    Row({ space: 8 }) {
-      Column({ space: 2 }) {
-        Text(this.profiles[index].name).fontSize(15).maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(this.profiles[index].type.toUpperCase() + ' · ' + this.profiles[index].server + ':' +
-          String(this.profiles[index].port))
-          .fontSize(11).fontColor('#8A8A8A').maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      .onClick(() => {
-        this.selected = index;
-        this.bump();
-      })
-
-      Text(Index.delayText(this.profiles[index].delay))
-        .fontSize(12)
-        .fontColor(this.profiles[index].delay >= 0 && this.profiles[index].delay < 1500 ? '#2E7D32' : '#8A8A8A')
-        .onClick(() => {
-          this.testOne(index);
-        })
-
-      if (index === this.selected) {
-        Text('✓').fontSize(16).fontColor('#0A59F7')
-      }
-
-      Text('编辑').fontSize(12).fontColor('#0A59F7').padding({ left: 4, right: 4 })
+  nodeSwipe(index: number) {
+    Row() {
+      Button('编辑')
+        .height('100%')
+        .width(92)
+        .fontSize(15)
+        .borderRadius(0)
+        .backgroundColor('#0A59F7')
+        .fontColor('#FFFFFF')
         .onClick(() => {
           this.openEdit(index);
         })
-      Text('删除').fontSize(12).fontColor('#E84026').padding({ left: 4, right: 4 })
+      Button('删除')
+        .height('100%')
+        .width(92)
+        .fontSize(15)
+        .borderRadius(0)
+        .backgroundColor('#E84026')
+        .fontColor('#FFFFFF')
         .onClick(() => {
           this.removeProfile(index);
         })
     }
+    .height('100%')
+  }
+
+  @Builder
+  nodeRow(row: NodeRow) {
+    Column({ space: 4 }) {
+      Row({ space: 6 }) {
+        Text(row.name).fontSize(17).maxLines(1).layoutWeight(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+        Text(Index.delayText(row.delay))
+          .fontSize(15)
+          .fontColor(row.delay >= 0 && row.delay < 1500 ? '#2E7D32' : '#8A8A8A')
+          .onClick(() => {
+            this.testOne(row.nodeIndex);
+          })
+
+        if (row.selected) {
+          Text('✓').fontSize(17).fontColor('#0A59F7')
+        }
+      }
+      .width('100%')
+
+      Text(row.addr)
+        .fontSize(14).fontColor('#5F5F5F').maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%')
+    }
     .width('100%')
-    .padding(10)
+    .alignItems(HorizontalAlign.Start)
+    .padding(12)
     .borderRadius(10)
-    .backgroundColor(index === this.selected ? '#EAF1FF' : '#F5F5F5')
+    .backgroundColor(row.selected ? '#EAF1FF' : '#F5F5F5')
+    // 整张卡片都能点选，而不是只有文字那一小条
+    .onClick(() => {
+      this.selectNode(row.nodeIndex);
+    })
+  }
+
+  @Builder
+  groupHeaderRow(row: NodeRow) {
+    Row({ space: 10 }) {
+      Text(row.groupKey.length > 0 ? (row.groupOpen ? '▾ ' : '▸ ') + row.groupTitle : row.groupTitle)
+        .fontSize(15)
+        .fontColor('#5A5A5A')
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .onClick(() => {
+          this.toggleKey(row.groupKey);
+        })
+      if (this.sortByDelay && row.groupCount > 1) {
+        Text('↓ 延迟')
+          .fontSize(13)
+          .fontColor('#2E7D32')
+      }
+      Text(String(row.groupCount) + ' 个')
+        .fontSize(14)
+        .fontColor('#8C8C8C')
+        .onClick(() => {
+          this.toggleKey(row.groupKey);
+        })
+      if (row.groupKey.length > 0) {
+        Text('更新').fontSize(14).fontColor('#0A59F7')
+          .onClick(() => {
+            this.refreshGroup(row.groupKey);
+          })
+      }
+      Text('测速').fontSize(14).fontColor('#0A59F7')
+        .onClick(() => {
+          this.testGroupByKey(row.groupKey);
+        })
+    }
+    .width('100%')
+    .padding({ left: 4, right: 4, top: 8, bottom: 4 })
+  }
+
+  @Builder
+  moreRow(row: NodeRow) {
+    Row() {
+      Text('再显示 ' + String(Index.PAGE_SIZE) + ' 个（共 ' +
+        String(row.moreLeft + this.nodeLimitOf(row.groupKey)) + ' 个）')
+        .fontSize(15).fontColor('#0A59F7')
+    }
+    .width('100%')
+    .justifyContent(FlexAlign.Center)
+    .padding(12)
+    .backgroundColor('#F0F4FF')
+    .borderRadius(10)
+    .onClick(() => {
+      this.moreNodes(row.groupKey);
+    })
+  }
+
+  nodeLimitOf(key: string): number {
+    const group: NodeGroup | undefined = this.nodeGroupByKey(key);
+    if (group === undefined) {
+      return 0;
+    }
+    return this.nodeLimit(group);
+  }
+
+  testGroupByKey(key: string): void {
+    const group: NodeGroup | undefined = this.nodeGroupByKey(key);
+    if (group !== undefined) {
+      this.testGroup(group);
+    }
   }
 
   @Builder
@@ -1276,14 +1742,14 @@ struct Index {
       Column({ space: 12 }) {
         Row() {
           Column({ space: 2 }) {
-            Text('订阅与导入').fontSize(18).fontWeight(FontWeight.Bold)
-            Text('按订阅分组 · 可单独更新/测速').fontSize(11).fontColor('#8A8A8A')
+            Text('订阅与导入').fontSize(19).fontWeight(FontWeight.Bold)
+            Text('按订阅分组 · 可单独更新/测速').fontSize(13).fontColor('#5A5A5A')
           }.alignItems(HorizontalAlign.Start).layoutWeight(1)
 
           Button('关闭')
-            .fontSize(12)
-            .height(32)
-            .width(64)
+            .fontSize(14)
+            .height(34)
+            .width(72)
             .padding({ left: 0, right: 0 })
             .backgroundColor('#F0F0F0')
             .fontColor('#333333')
@@ -1294,50 +1760,50 @@ struct Index {
 
         TextInput({ text: this.subInput, placeholder: '订阅链接 https://…' })
           .width('100%')
-          .height(40)
-          .fontSize(13)
+          .height(44)
+          .fontSize(14)
           .onChange((v: string) => {
             this.subInput = v;
           })
 
         Button('从订阅链接导入')
           .width('100%')
-          .height(40)
-          .fontSize(14)
+          .height(44)
+          .fontSize(15)
           .onClick(() => {
             this.importSubscription();
           })
 
-        Text('单条链接').fontSize(12).fontColor('#8A8A8A')
+        Text('单条链接').fontSize(14).fontColor('#5A5A5A')
 
         TextArea({ text: this.linkInput, placeholder: '粘贴 vmess:// vless:// ss:// trojan:// 链接，一行一个' })
           .width('100%')
           .height(110)
-          .fontSize(12)
+          .fontSize(13)
           .onChange((value: string) => {
             this.linkInput = value;
           })
 
         Row({ space: 10 }) {
-          Button('剪贴板导入').layoutWeight(1).height(36).fontSize(13)
+          Button('剪贴板导入').layoutWeight(1).height(40).fontSize(14)
             .backgroundColor('#F0F0F0').fontColor('#333333')
             .onClick(() => {
               this.importFromClipboard();
             })
-          Button('解析导入').layoutWeight(1).height(36).fontSize(13)
+          Button('解析导入').layoutWeight(1).height(40).fontSize(14)
             .onClick(() => {
               this.importFromText();
             })
         }.width('100%')
 
         Text('导入后写进 core.yaml；连接状态下自动重连生效。')
-          .fontSize(11)
-          .fontColor('#8A8A8A')
+          .fontSize(13)
+          .fontColor('#5A5A5A')
 
         Button('设置 · 分流规则')
           .width('100%')
-          .height(40)
-          .fontSize(14)
+          .height(44)
+          .fontSize(15)
           .backgroundColor('#F0F0F0')
           .fontColor('#333333')
           .onClick(() => {
@@ -1370,9 +1836,9 @@ struct Index {
     Column({ space: 10 }) {
       Row({ space: 8 }) {
         Button('返回')
-          .width(72)
-          .height(34)
-          .fontSize(13)
+          .width(76)
+          .height(38)
+          .fontSize(14)
           .backgroundColor('#F0F0F0')
           .fontColor('#333333')
           .onClick(() => {
@@ -1381,28 +1847,28 @@ struct Index {
             this.ruleEditing = -1;
           })
         Text('分流规则')
-          .fontSize(18)
+          .fontSize(19)
           .fontWeight(FontWeight.Bold)
           .layoutWeight(1)
         Button('保存')
-          .width(80)
-          .height(34)
-          .fontSize(13)
+          .width(84)
+          .height(38)
+          .fontSize(14)
           .onClick(() => {
             this.saveRulesNow();
           })
       }.width('100%')
 
       Text('从上到下逐条匹配，命中即停；地址栏默认内置推荐规则集，换成自己的规则订阅网址后会记住。')
-        .fontSize(11)
-        .fontColor('#8A8A8A')
+        .fontSize(13)
+        .fontColor('#5A5A5A')
         .width('100%')
 
       Row({ space: 8 }) {
         TextInput({ text: this.ruleUrl, placeholder: '内置推荐规则集 / 规则订阅地址 https://…' })
           .layoutWeight(1)
-          .height(38)
-          .fontSize(12)
+          .height(42)
+          .fontSize(13)
           .enterKeyType(EnterKeyType.Go)
           .onChange((v: string) => {
             this.ruleUrl = v;
@@ -1411,9 +1877,9 @@ struct Index {
             this.importRulesFromUrl();
           })
         Button('网址更新')
-          .width(128)
-          .height(38)
-          .fontSize(13)
+          .width(120)
+          .height(42)
+          .fontSize(14)
           .onClick(() => {
             this.importRulesFromUrl();
           })
@@ -1422,8 +1888,8 @@ struct Index {
       Row({ space: 8 }) {
         Button('文件导入')
           .layoutWeight(1)
-          .height(38)
-          .fontSize(13)
+          .height(42)
+          .fontSize(14)
           .backgroundColor('#F0F0F0')
           .fontColor('#333333')
           .onClick(() => {
@@ -1431,8 +1897,8 @@ struct Index {
           })
         Button('导出规则')
           .layoutWeight(1)
-          .height(38)
-          .fontSize(13)
+          .height(42)
+          .fontSize(14)
           .backgroundColor('#F0F0F0')
           .fontColor('#333333')
           .onClick(() => {
@@ -1441,8 +1907,8 @@ struct Index {
       }.width('100%')
 
       Text(this.ruleMsg.length > 0 ? this.ruleMsg : '手动改规则后点右上角「保存」；也可以整份从文件或网址覆盖')
-        .fontSize(11)
-        .fontColor(this.ruleMsg.length > 0 ? '#0A59F7' : '#8A8A8A')
+        .fontSize(13)
+        .fontColor(this.ruleMsg.length > 0 ? '#0A59F7' : '#5A5A5A')
         .maxLines(2)
         .width('100%')
 
@@ -1456,19 +1922,19 @@ struct Index {
                 })
               Column({ space: 2 }) {
                 Text(rule.title)
-                  .fontSize(14)
-                  .fontColor(rule.enabled ? '#222222' : '#AAAAAA')
+                  .fontSize(16)
+                  .fontColor(rule.enabled ? '#222222' : '#8C8C8C')
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
                 Text(rule.kind + (rule.value.length > 0 ? ',' + rule.value : '') + ',' + rule.target)
-                  .fontSize(11)
-                  .fontColor('#8A8A8A')
+                  .fontSize(13)
+                  .fontColor('#5F5F5F')
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
               }.layoutWeight(1).alignItems(HorizontalAlign.Start)
 
               Text(rule.target)
-                .fontSize(11)
+                .fontSize(13)
                 .fontColor(rule.target === 'DIRECT' ? '#2E7D32' :
                   (rule.target === 'PROXY' ? '#0A59F7' : '#E84026'))
                 .backgroundColor('#FFFFFF')
@@ -1479,20 +1945,20 @@ struct Index {
                 })
 
               Text('编辑')
-                .fontSize(12)
+                .fontSize(14)
                 .fontColor('#0A59F7')
                 .onClick(() => {
                   this.openRuleEdit(index);
                 })
               Text('删除')
-                .fontSize(12)
+                .fontSize(14)
                 .fontColor('#E84026')
                 .onClick(() => {
                   this.removeRule(index);
                 })
             }
             .width('100%')
-            .padding(10)
+            .padding(12)
             .backgroundColor('#F7F7F7')
             .borderRadius(10)
           }, (rule: RuleItem, index: number) => rule.id + '|' + rule.kind + '|' + rule.value + '|' +
@@ -1501,8 +1967,8 @@ struct Index {
           if (this.rules.length > this.rulesLimit) {
             Button('再显示 50 条（共 ' + String(this.rules.length) + ' 条）')
               .width('100%')
-              .height(36)
-              .fontSize(13)
+              .height(40)
+              .fontSize(14)
               .backgroundColor('#EAF1FF')
               .fontColor('#0A59F7')
               .onClick(() => {
@@ -1512,8 +1978,8 @@ struct Index {
 
           Button('恢复默认规则集')
             .width('100%')
-            .height(36)
-            .fontSize(13)
+            .height(40)
+            .fontSize(14)
             .backgroundColor('#FFF4F2')
             .fontColor('#E84026')
             .onClick(() => {
@@ -1522,8 +1988,8 @@ struct Index {
 
           Button('+ 添加规则')
             .width('100%')
-            .height(36)
-            .fontSize(13)
+            .height(40)
+            .fontSize(14)
             .backgroundColor('#F0F0F0')
             .fontColor('#333333')
             .onClick(() => {
@@ -1546,50 +2012,50 @@ struct Index {
     Column() {
       Scroll() {
         Column({ space: 10 }) {
-          Text('规则编辑').fontSize(18).fontWeight(FontWeight.Bold).width('100%')
+          Text('规则编辑').fontSize(19).fontWeight(FontWeight.Bold).width('100%')
 
       Row({ space: 8 }) {
-        Text('名称').fontSize(13).width(52)
+        Text('名称').fontSize(14).width(56)
         TextInput({ text: this.rTitle, placeholder: '显示名，如「代理 Google」' })
           .layoutWeight(1)
-          .height(38)
-          .fontSize(13)
+          .height(42)
+          .fontSize(14)
           .onChange((v: string) => {
             this.rTitle = v;
           })
       }.width('100%')
 
-      Text('类型').fontSize(13).width('100%')
+      Text('类型').fontSize(14).width('100%')
       Row({ space: 8 }) {
-        Button('GEOSITE').layoutWeight(1).height(34).fontSize(12)
+        Button('GEOSITE').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rKind === 'GEOSITE' ? '#0A59F7' : '#F0F0F0')
           .fontColor(this.rKind === 'GEOSITE' ? '#FFFFFF' : '#333333')
           .padding(0)
           .onClick(() => {
             this.rKind = 'GEOSITE';
           })
-        Button('GEOIP').layoutWeight(1).height(34).fontSize(12)
+        Button('GEOIP').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rKind === 'GEOIP' ? '#0A59F7' : '#F0F0F0')
           .fontColor(this.rKind === 'GEOIP' ? '#FFFFFF' : '#333333')
           .padding(0)
           .onClick(() => {
             this.rKind = 'GEOIP';
           })
-        Button('DOMAIN').layoutWeight(1).height(34).fontSize(12)
+        Button('DOMAIN').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rKind === 'DOMAIN-SUFFIX' ? '#0A59F7' : '#F0F0F0')
           .fontColor(this.rKind === 'DOMAIN-SUFFIX' ? '#FFFFFF' : '#333333')
           .padding(0)
           .onClick(() => {
             this.rKind = 'DOMAIN-SUFFIX';
           })
-        Button('IP-CIDR').layoutWeight(1).height(34).fontSize(12)
+        Button('IP-CIDR').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rKind === 'IP-CIDR' ? '#0A59F7' : '#F0F0F0')
           .fontColor(this.rKind === 'IP-CIDR' ? '#FFFFFF' : '#333333')
           .padding(0)
           .onClick(() => {
             this.rKind = 'IP-CIDR';
           })
-        Button('MATCH').layoutWeight(1).height(34).fontSize(12)
+        Button('MATCH').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rKind === 'MATCH' ? '#0A59F7' : '#F0F0F0')
           .fontColor(this.rKind === 'MATCH' ? '#FFFFFF' : '#333333')
           .padding(0)
@@ -1598,37 +2064,37 @@ struct Index {
           })
       }.width('100%')
       Text('GEOSITE 域名库 / GEOIP IP 库 / DOMAIN 单个域名 / IP-CIDR 网段 / MATCH 兜底')
-        .fontSize(10)
-        .fontColor('#AAAAAA')
+        .fontSize(12)
+        .fontColor('#7A7A7A')
         .width('100%')
 
       Row({ space: 8 }) {
-        Text('内容').fontSize(13).width(52)
+        Text('内容').fontSize(14).width(56)
         TextInput({ text: this.rValue, placeholder: 'cn / CN / google.com / 10.0.0.0/8' })
           .layoutWeight(1)
-          .height(38)
-          .fontSize(13)
+          .height(42)
+          .fontSize(14)
           .enabled(this.rKind !== 'MATCH')
           .onChange((v: string) => {
             this.rValue = v;
           })
       }.width('100%')
 
-      Text('策略').fontSize(13).width('100%')
+      Text('策略').fontSize(14).width('100%')
       Row({ space: 8 }) {
-        Button('直连 DIRECT').layoutWeight(1).height(34).fontSize(12)
+        Button('直连 DIRECT').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rTarget === 'DIRECT' ? '#2E7D32' : '#F0F0F0')
           .fontColor(this.rTarget === 'DIRECT' ? '#FFFFFF' : '#333333')
           .onClick(() => {
             this.rTarget = 'DIRECT';
           })
-        Button('代理 PROXY').layoutWeight(1).height(34).fontSize(12)
+        Button('代理 PROXY').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rTarget === 'PROXY' ? '#0A59F7' : '#F0F0F0')
           .fontColor(this.rTarget === 'PROXY' ? '#FFFFFF' : '#333333')
           .onClick(() => {
             this.rTarget = 'PROXY';
           })
-        Button('阻断 REJECT').layoutWeight(1).height(34).fontSize(12)
+        Button('阻断 REJECT').layoutWeight(1).height(38).fontSize(14)
           .backgroundColor(this.rTarget === 'REJECT' ? '#E84026' : '#F0F0F0')
           .fontColor(this.rTarget === 'REJECT' ? '#FFFFFF' : '#333333')
           .onClick(() => {
@@ -1681,26 +2147,30 @@ struct Index {
               this.drawerOpen = true;
             })
           Column({ space: 2 }) {
-            Text('v2rayNG 鸿蒙版').fontSize(21).fontWeight(FontWeight.Bold)
-            Text(this.summary).fontSize(11).fontColor('#8A8A8A')
+            Text('v2rayNG 鸿蒙版').fontSize(21).fontWeight(FontWeight.Bold).fontColor('#FFFFFF')
+            Text(this.summary).fontSize(13).fontColor('#FFE3E3')
           }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        }.width('100%')
+        }
+        .width('100%')
+        .padding({ left: 8, right: 12, top: 10, bottom: 10 })
+        .borderRadius(14)
+        .backgroundColor('#8B3A3A')
 
         Row({ space: 12 }) {
-          Text(this.statusText).fontSize(13).fontColor(this.running ? '#2E7D32' : '#8A8A8A')
-          Text(this.trafficText).fontSize(13).fontColor('#0A59F7')
+          Text(this.statusText).fontSize(15).fontColor(this.running ? '#2E7D32' : '#5A5A5A')
+          Text(this.trafficText).fontSize(15).fontColor('#0A59F7')
           if (this.testInfo.length > 0) {
-            Text(this.testInfo).fontSize(13).fontColor('#E84026')
+            Text(this.testInfo).fontSize(15).fontColor('#E84026')
           }
         }.width('100%')
 
         Row({ space: 10 }) {
-          Button('添加节点').layoutWeight(1).height(32).fontSize(13)
+          Button('添加节点').layoutWeight(1).height(38).fontSize(15)
             .backgroundColor('#F0F0F0').fontColor('#333333')
             .onClick(() => {
               this.addNew();
             })
-          Button(this.testing ? '测速中…' : '全部测速').layoutWeight(1).height(32).fontSize(13)
+          Button(this.testing ? '测速中…' : '全部测速').layoutWeight(1).height(38).fontSize(15)
             .backgroundColor('#F0F0F0').fontColor('#333333')
             .enabled(!this.testing)
             .onClick(() => {
@@ -1709,33 +2179,45 @@ struct Index {
         }.width('100%')
 
         List({ space: 8 }) {
-          ForEach(this.groupList(), (group: NodeGroup) => {
-            ListItem() {
-              Column({ space: 6 }) {
-                this.groupHeader(group)
-                if (this.groupOpen(group)) {
-                  ForEach(group.indices, (index: number) => {
-                    this.nodeRow(index)
-                  }, (index: number) => String(index) + '|' + String(this.stamp))
-                }
+          // LazyForEach：只创建屏幕内可见的行，几百个节点也不会拖慢主线程
+          LazyForEach(this.dataSource, (row: NodeRow) => {
+            if (row.kind === 1) {
+              ListItem() {
+                this.nodeRow(row)
+              }
+              .width('100%')
+              .swipeAction({ end: (): void => { this.nodeSwipe(row.nodeIndex) } })
+            } else if (row.kind === 0) {
+              ListItem() {
+                this.groupHeaderRow(row)
+              }
+              .width('100%')
+            } else {
+              ListItem() {
+                this.moreRow(row)
               }
               .width('100%')
             }
-          }, (group: NodeGroup) => group.key + '|' + String(this.stamp))
+          }, (row: NodeRow) => row.key + (row.selected ? '|1' : '|0'))
         }
         .layoutWeight(1)
         .width('100%')
 
         // 代理开关：放在最底部，单手拇指就能够到
         Row() {
-          Button(this.running ? '停止代理' : '开启代理')
+          Button(this.busy ? (this.running ? '正在断开…' : '正在连接…') :
+            (this.running ? '停止代理' : '开启代理'))
             .layoutWeight(1)
             .height(50)
             .fontSize(17)
             .fontWeight(FontWeight.Medium)
+            .enabled(!this.busy)
             .backgroundColor(this.running ? '#E84026' : '#0A59F7')
             .fontColor('#FFFFFF')
             .onClick(() => {
+              if (this.busy) {
+                return;
+              }
               this.connect();
             })
         }
