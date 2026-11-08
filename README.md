@@ -113,10 +113,18 @@ tools/                          命令行构建脚本
 不想在本机配鸿蒙环境，直接让 GitHub 编：`.github/workflows/build-hap.yml` 在推送到 `main`、
 提 PR、或手动 `workflow_dispatch` 时跑一遍，产出**未签名**的 HAP。
 
-流程：装 Node 22 + JDK 17 → 拉 OpenHarmony SDK（`5.0.3-Release`，API 15，缓存全量包）→
-从本仓库 Release（tag `hvigor-5.19.8`）下载 hvigor 的两个自包含 tarball 解压到 `node_modules` →
+流程：装 Node 22 + JDK 17 → 拉 OpenHarmony SDK（`5.0.3-Release`，API 15，包内 5 个组件 zip
+逐个解压，整份缓存）→ 从本仓库 Release（tag `hvigor-5.19.8`）下载 hvigor 的两个自包含 tarball
+解压到 `node_modules` → 用 `ci/ohos-sdk-patch/` 覆盖 SDK（补齐 `vpn` 扩展类型）→
 `hvigor --mode module -p module=entry@default -p product=default assembleHap` →
 把 `entry-default-unsigned.hap` 作为 artifact 上传。
+
+> 为什么需要 SDK 补丁：OpenHarmony 5.0.3 公共 SDK 的 `toolchains/modulecheck/module.json`
+> schema 与 `@kit.NetworkKit` 导出里都没有 `vpn` 扩展类型，直接构建会在 PreBuild 报
+> `00303038 Configuration Error`（`module.extensionAbilities[0].type` 不在枚举内）。
+> `ci/ohos-sdk-patch/` 下是同一版本 SDK 中对应的 Apache-2.0 文件（module schema、
+> `@ohos.net.vpnExtension` 等 d.ts、`@kit.NetworkKit` 导出），构建前覆盖进 SDK 即可。
+
 
 > 为什么不用 npm：`@ohos/hvigor` 与 `@ohos/hvigor-ohos-plugin` 只发布在 `repo.harmonyos.com`，
 > 而 `npm ci` 在干净的 runner 上会因 lock 文件与 bundle 依赖不同步（缺 `fsevents`、
@@ -128,7 +136,7 @@ tools/                          命令行构建脚本
 - **为什么一定没签名**：`app/build-profile.json5` 里 `signingConfigs` 是空数组，hvigor 只会产出未签名包
 - **耗时**：首次约 10 分钟（要下 4.3GB SDK），之后命中缓存约 2 分钟
 - **签名**：下下来后按下面「签名与装机」一节自己签；不签名的包无法直接安装
-- **产物大小**：约 78MB（不含 `geoip.dat` / `geosite.dat`，这两个数据文件不入库）
+- **产物大小**：约 51MB（不含 `geoip.dat` / `geosite.dat`，这两个数据文件不入库，运行时按需下载）
 
 ## 构建
 
