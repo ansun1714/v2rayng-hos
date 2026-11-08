@@ -17,6 +17,58 @@ const TEST_URL: string = 'http://www.gstatic.com/generate_204';
 /** 规则订阅地址的默认值：内置推荐规则集（点「网址更新」即还原默认 6 条）。 */
 const BUILTIN_RULE_SRC: string = 'builtin://default';
 
+/**
+ * 出口 IP 归属查询地址。已连接时代理生效、本应用没被 protect，
+ * 这两个请求就是经节点出去的，返回的 IP 即「出口」而非本地宽带。
+ */
+const EXIT_URL_PRIMARY: string = 'https://myip.ipip.net/';
+const EXIT_URL_BACKUP: string = 'https://api.ip.sb/geoip';
+
+interface ExitGeo {
+  ip?: string;
+  country?: string;
+  country_code?: string;
+  region?: string;
+  city?: string;
+}
+
+/** 一次出口探测的结果；suspect = 归属落在中国大陆，多半这一枪走的是手机自己的网络 */
+interface ExitProbe {
+  text: string;
+  suspect: boolean;
+}
+
+/** 备用源（api.ip.sb）返回英文，常见国家和城市映射成中文，保证「国家」一定看得懂 */
+const GEO_CN: Map<string, string> = new Map<string, string>([
+  ['China', '中国'], ['Hong Kong', '中国香港'], ['Taiwan', '中国台湾'], ['Macau', '中国澳门'],
+  ['Singapore', '新加坡'], ['Japan', '日本'], ['South Korea', '韩国'], ['Korea', '韩国'],
+  ['United States', '美国'], ['USA', '美国'], ['Canada', '加拿大'], ['United Kingdom', '英国'],
+  ['Germany', '德国'], ['France', '法国'], ['Netherlands', '荷兰'], ['Switzerland', '瑞士'],
+  ['Sweden', '瑞典'], ['Finland', '芬兰'], ['Norway', '挪威'], ['Denmark', '丹麦'],
+  ['Italy', '意大利'], ['Spain', '西班牙'], ['Austria', '奥地利'], ['Ireland', '爱尔兰'],
+  ['Belgium', '比利时'], ['Poland', '波兰'], ['Czechia', '捷克'], ['Portugal', '葡萄牙'],
+  ['Greece', '希腊'], ['Russia', '俄罗斯'], ['Ukraine', '乌克兰'], ['Turkey', '土耳其'],
+  ['Israel', '以色列'], ['United Arab Emirates', '阿联酋'], ['India', '印度'], ['Thailand', '泰国'],
+  ['Vietnam', '越南'], ['Malaysia', '马来西亚'], ['Philippines', '菲律宾'], ['Indonesia', '印度尼西亚'],
+  ['Australia', '澳大利亚'], ['New Zealand', '新西兰'], ['Brazil', '巴西'], ['Argentina', '阿根廷'],
+  ['Mexico', '墨西哥'], ['Chile', '智利'], ['South Africa', '南非'], ['Egypt', '埃及'],
+  ['Tokyo', '东京'], ['Osaka', '大阪'], ['Seoul', '首尔'], ['North Chungcheong', '忠清北道'],
+  ['Los Angeles', '洛杉矶'], ['San Jose', '圣何塞'], ['San Francisco', '旧金山'], ['New York', '纽约'],
+  ['Seattle', '西雅图'], ['Dallas', '达拉斯'], ['Silicon Valley', '硅谷'], ['Ashburn', '阿什本'],
+  ['London', '伦敦'], ['Frankfurt', '法兰克福'], ['Amsterdam', '阿姆斯特丹'], ['Paris', '巴黎'],
+  ['Berlin', '柏林'], ['Sydney', '悉尼'], ['Melbourne', '墨尔本'], ['Toronto', '多伦多'],
+  ['Moscow', '莫斯科'], ['Bangkok', '曼谷'], ['Kuala Lumpur', '吉隆坡'], ['Manila', '马尼拉'],
+  ['Jakarta', '雅加达'], ['Mumbai', '孟买'], ['Taipei', '台北'], ['Kowloon', '九龙'],
+  ['Jiangsu', '江苏'], ['Zhejiang', '浙江'], ['Guangdong', '广东'], ['Shanghai', '上海'],
+  ['Beijing', '北京'], ['Fujian', '福建'], ['Sichuan', '四川'], ['Hong Kong Island', '香港岛']
+]);
+
+function geoCn(name: string): string {
+  const key: string = name.trim();
+  const hit: string | undefined = GEO_CN.get(key);
+  return hit !== undefined ? hit : key;
+}
+
 /** 节点分组：key 为空表示手动添加的节点，否则为订阅 URL。 */
 class NodeGroup {
   key: string = '';
@@ -42,6 +94,9 @@ class NodeRow {
   addr: string = '';
   selected: boolean = false;
   moreLeft: number = 0;
+  /** 订阅组在这里是一整块卡片：首行给上圆角、末行给下圆角 */
+  firstInBlock: boolean = false;
+  lastInBlock: boolean = false;
 }
 
 /** LazyForEach 的数据源：整体换行数组后通知列表刷新。 */
@@ -139,6 +194,11 @@ struct Index {
   @State running: boolean = false;
   @State statusText: string = '未连接';
   @State trafficText: string = '';
+  /** 当前出口 IP 归属，例如「出口 1.2.3.4 · 中国 江苏 无锡」；已连接时代理生效，请求走的就是出口 */
+  @State exitInfo: string = '';
+  @State exitBusy: boolean = false;
+  /** 出口检测的请求代际：切节点/断开时自增，旧请求的结果回来直接作废 */
+  private exitSeq: number = 0;
   @State summary: string = 'mihomo 内核 · 国内直连 / 国外代理';
   @State linkInput: string = '';
   @State subInput: string = '';
@@ -190,6 +250,11 @@ struct Index {
   @State ePath: string = '';
   @State eHost: string = '';
 
+  // 订阅分组改名：key = 订阅 URL，value = 用户自己起的名字（存 group-names.json）
+  @State renameKey: string = '';
+  @State renameText: string = '';
+  private groupNames: Map<string, string> = new Map<string, string>();
+
   private filesDir: string = '';
   private pollTimer: number = -1;
   /** 系统 VPN 存活校验（state.json 可能残留 running=true） */
@@ -224,6 +289,7 @@ struct Index {
       FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
     }
     this.reload();
+    this.loadGroupNames();
     this.refreshRows();
     if (this.profiles.length === 0) {
       this.seedDefaultNodes();
@@ -369,6 +435,16 @@ struct Index {
       // 值没变就不赋值：每秒都写一遍 @State 会白白触发整页重绘（列表里有几百个节点）
       if (this.running !== state.running) {
         this.running = state.running;
+        if (this.running) {
+          // 刚连上，隧道还没稳，稍等一下再测出口
+          this.scheduleExitRefresh(2000, 1);
+        } else {
+          this.exitSeq++;
+          this.exitBusy = false;
+          if (this.exitInfo.length > 0) {
+            this.exitInfo = '';
+          }
+        }
       }
       if (this.statusText !== state.message && Date.now() > this.statusManualUntil) {
         this.statusText = state.message;
@@ -395,6 +471,57 @@ struct Index {
       return (value / 1024).toFixed(1) + 'KB';
     }
     return String(value) + 'B';
+  }
+
+  /** IPv6 出口地址太长，中段省略，别把后面的地区挤掉 */
+  static shortIp(ip: string): string {
+    if (ip.length <= 24) {
+      return ip;
+    }
+    return ip.substring(0, 10) + '…' + ip.substring(ip.length - 8);
+  }
+
+  /** 归属落在中国大陆（港澳台除外）= 这一枪大概率走了手机自己的网络，不是节点出口 */
+  static looksLocal(loc: string): boolean {
+    if (loc.length === 0) {
+      return false;
+    }
+    if (loc.indexOf('香港') >= 0 || loc.indexOf('台湾') >= 0 || loc.indexOf('澳门') >= 0) {
+      return false;
+    }
+    // 省份名兜底：ipip 有时不给「中国」前缀，只给「江苏 无锡 电信」
+    const provinces: string[] = ['北京', '天津', '河北', '山西', '内蒙古', '辽宁', '吉林', '黑龙江',
+      '上海', '江苏', '浙江', '安徽', '福建', '江西', '山东', '河南', '湖北', '湖南', '广东',
+      '广西', '海南', '重庆', '四川', '贵州', '云南', '西藏', '陕西', '甘肃', '青海', '宁夏', '新疆'];
+    let hit: boolean = false;
+    provinces.forEach((item: string) => {
+      if (loc.indexOf(item) >= 0) {
+        hit = true;
+      }
+    });
+    return hit || loc.indexOf('中国') === 0;
+  }
+
+  /** 归属只留「国家 + 省级」：城市和运营商一行放不下；重复段（如「新加坡 新加坡」）合并掉 */
+  static shortLoc(loc: string): string {
+    const text: string = loc.trim();
+    if (text.length === 0) {
+      return '';
+    }
+    const seg: string[] = text.split(' ');
+    const uniq: string[] = [];
+    seg.forEach((item: string) => {
+      if (item.length > 0 && uniq.indexOf(item) < 0) {
+        uniq.push(item);
+      }
+    });
+    if (uniq.length === 0) {
+      return '';
+    }
+    if (uniq.length <= 2) {
+      return uniq.join(' ');
+    }
+    return uniq[0] + ' ' + uniq[1];
   }
 
   /** 名称去重：mihomo 要求代理名唯一。 */
@@ -457,10 +584,22 @@ struct Index {
     this.switchTimer = setTimeout(() => {
       this.switchTimer = -1;
       this.reconnectSoon();
+      // 换了节点，出口 IP 会变：等重连完成再重新测一次
+      this.scheduleExitRefresh(3200, 1);
     }, 800);
   }
 
   /** 按当前数据重建列表行：分组头 + 展开的节点（受分页限制）+「再显示」。 */
+  /**
+   * LazyForEach 的行 key。凡是会影响这一行显示的值都必须进来：
+   * 延迟、选中、折叠状态、剩余数量、节点数。少一个，那一项变了也不会重绘
+   * （测速后延迟不显示、不重排，就是这么来的）。
+   */
+  rowKey(row: NodeRow): string {
+    return row.key + '|' + String(row.delay) + '|' + String(row.moreLeft) + '|' +
+      String(row.groupCount) + '|' + (row.selected ? '1' : '0') + '|' + (row.groupOpen ? 'o' : 'c');
+  }
+
   refreshRows(): void {
     this.dataSource.setRows(this.buildRows());
   }
@@ -471,17 +610,23 @@ struct Index {
     groups.forEach((group: NodeGroup) => {
       const head: NodeRow = new NodeRow();
       head.kind = 0;
-      head.key = 'h:' + group.key;
+      // key 里带上标题：用户改名后 key 变化，LazyForEach 才会重建这一行
+      head.key = 'h:' + group.key + ':' + group.title;
       head.groupKey = group.key;
       head.groupTitle = group.title;
       head.groupCount = group.indices.length;
       head.groupOpen = this.groupOpen(group);
+      head.firstInBlock = true;
+      // 折叠着、或组里没节点：这一行就是整块的头尾
+      head.lastInBlock = !head.groupOpen || group.indices.length === 0;
       rows.push(head);
       if (!head.groupOpen) {
         return;
       }
       const limit: number = this.nodeLimit(group);
-      group.indices.slice(0, limit).forEach((index: number) => {
+      const shown: number[] = group.indices.slice(0, limit);
+      const hasMore: boolean = group.indices.length > limit;
+      shown.forEach((index: number, pos: number) => {
         const p: Profile = this.profiles[index];
         const row: NodeRow = new NodeRow();
         row.kind = 1;
@@ -492,14 +637,18 @@ struct Index {
         row.delay = p.delay;
         row.addr = p.type.toUpperCase() + ' · ' + p.server + ':' + String(p.port);
         row.selected = index === this.selected;
+        row.firstInBlock = false;
+        row.lastInBlock = !hasMore && pos === shown.length - 1;
         rows.push(row);
       });
-      if (group.indices.length > limit) {
+      if (hasMore) {
         const more: NodeRow = new NodeRow();
         more.kind = 2;
         more.key = 'm:' + group.key;
         more.groupKey = group.key;
         more.moreLeft = group.indices.length - limit;
+        more.firstInBlock = false;
+        more.lastInBlock = true;
         rows.push(more);
       }
     });
@@ -525,7 +674,9 @@ struct Index {
       if (group === undefined) {
         group = new NodeGroup();
         group.key = key;
-        group.title = Index.subTitle(key);
+        // 用户改过名就用他自己的名字，否则取订阅链接的 host
+        const custom: string | undefined = this.groupNames.get(key);
+        group.title = custom !== undefined && custom.length > 0 ? custom : Index.subTitle(key);
         byKey.set(key, group);
         subs.push(group);
       }
@@ -567,6 +718,63 @@ struct Index {
       const pb: number = pos.get(b) !== undefined ? pos.get(b) as number : 0;
       return pa - pb;
     });
+  }
+
+  /** 订阅分组的自定义名称：存 group-names.json，[[订阅URL, 名字], ...] */
+  loadGroupNames(): void {
+    const text: string = FileStore.readText2(this.filesDir, 'group-names.json');
+    if (text.length === 0) {
+      return;
+    }
+    try {
+      const pairs: string[][] = JSON.parse(text) as string[][];
+      pairs.forEach((pair: string[]) => {
+        if (pair.length >= 2 && pair[0].length > 0) {
+          this.groupNames.set(pair[0], pair[1]);
+        }
+      });
+    } catch (err) {
+    }
+  }
+
+  saveGroupNames(): void {
+    const pairs: string[][] = [];
+    this.groupNames.forEach((name: string, key: string) => {
+      pairs.push([key, name]);
+    });
+    FileStore.writeText2(this.filesDir, 'group-names.json', JSON.stringify(pairs));
+  }
+
+  openRename(key: string): void {
+    this.renameKey = key;
+    const custom: string | undefined = this.groupNames.get(key);
+    this.renameText = custom !== undefined ? custom : '';
+  }
+
+  closeRename(): void {
+    this.renameKey = '';
+    this.renameText = '';
+  }
+
+  /** 留空 = 恢复成默认的 host 名，方便随时改回去。 */
+  saveRename(): void {
+    const key: string = this.renameKey;
+    if (key.length === 0) {
+      return;
+    }
+    const name: string = this.renameText.trim();
+    if (name.length === 0) {
+      this.groupNames.delete(key);
+    } else {
+      this.groupNames.set(key, name);
+    }
+    this.saveGroupNames();
+    // 分组名不进 profiles 引用，缓存得住就刷不出来，这里强制失效
+    this.cacheProfiles = undefined;
+    this.cacheGroups = [];
+    this.closeRename();
+    this.bump();
+    this.toast.showToast({ message: name.length === 0 ? '已恢复默认名称' : '已重命名为「' + name + '」' });
   }
 
   /** 订阅标题：取 host[:port]，避免整条长链接把行撑爆。 */
@@ -747,6 +955,116 @@ struct Index {
     } finally {
       req.destroy();
     }
+  }
+
+  /**
+   * 出口 IP 归属。已连接时代理生效、本应用自身没被 protect，
+   * 这里的 HTTP 请求就是经节点出去的，返回的 IP 即节点出口，不是本地宽带。
+   */
+  scheduleExitRefresh(delayMs: number, attempt: number): void {
+    setTimeout(() => {
+      this.refreshExit(attempt);
+    }, delayMs);
+  }
+
+  async refreshExit(attempt: number): Promise<void> {
+    const seq: number = ++this.exitSeq;
+    this.exitBusy = true;
+    // 刚点连接 / 刚切节点时 running 还没翻过来，先等隧道，最多约 4 秒
+    let waited: number = 0;
+    while (!this.running && waited < 5 && seq === this.exitSeq) {
+      await Index.sleep(600);
+      waited++;
+    }
+    if (seq !== this.exitSeq) {
+      return;
+    }
+    let text: string = '';
+    let suspect: boolean = false;
+    if (this.running) {
+      const res: ExitProbe = await this.probeExit();
+      text = res.text;
+      suspect = res.suspect;
+      FileStore.appendLog(this.filesDir, 'exit probe #' + String(attempt) +
+        ' suspect=' + String(suspect) + ' -> ' + text);
+    }
+    if (seq !== this.exitSeq) {
+      return;
+    }
+    if (text.length > 0 && !suspect) {
+      this.exitBusy = false;
+      if (this.exitInfo !== text) {
+        this.exitInfo = text;
+      }
+      return;
+    }
+    // 空结果（隧道还没通）或归属是中国大陆（走了直连）：这一枪不算数，等一会儿重测，
+    // 不把错误结果写到界面上，避免「先显示国内 IP、过一会才变」。
+    if (this.running && attempt < 4) {
+      this.scheduleExitRefresh(text.length === 0 ? 2500 : 1500, attempt + 1);
+      return;
+    }
+    this.exitBusy = false;
+    if (text.length > 0) {
+      // 连测多枪都是大陆归属：用户可能真选了国内节点，照样显示
+      if (this.exitInfo !== text) {
+        this.exitInfo = text;
+      }
+      return;
+    }
+    if (!this.running && this.exitInfo.length > 0) {
+      this.exitInfo = '';
+    }
+  }
+
+  async probeExit(): Promise<ExitProbe> {
+    const text: string = await this.httpGet(EXIT_URL_PRIMARY, 5000);
+    if (text.length > 0) {
+      const ipMatch = text.match(/IP[：:]\s*([0-9a-fA-F.:]+)/);
+      const locMatch = text.match(/来自于[：:]\s*(.+)/);
+      let ip: string = '';
+      if (ipMatch !== null && ipMatch.length > 1) {
+        ip = ipMatch[1].trim();
+      }
+      let loc: string = '';
+      if (locMatch !== null && locMatch.length > 1) {
+        loc = locMatch[1].replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+      }
+      if (ip.length > 0) {
+        const loc2: string = Index.shortLoc(loc);
+        const body: string = '出口 ' + Index.shortIp(ip) + (loc2.length > 0 ? ' · ' + loc2 : '');
+        FileStore.appendLog(this.filesDir, 'ipip raw: ' +
+          text.replace(/[\r\n]+/g, ' ').substring(0, 120));
+        return { text: body, suspect: Index.looksLocal(loc2) };
+      }
+    }
+    // 备用源（返回 JSON，字段是英文）
+    const json: string = await this.httpGet(EXIT_URL_BACKUP, 5000);
+    if (json.length > 0) {
+      try {
+        const geo = JSON.parse(json) as ExitGeo;
+        const ip: string = geo.ip !== undefined ? geo.ip : '';
+        const code: string = geo.country_code !== undefined ? geo.country_code.toUpperCase() : '';
+        const parts: string[] = [];
+        if (geo.country !== undefined && geo.country.length > 0) {
+          parts.push(geoCn(geo.country));
+        }
+        if (geo.region !== undefined && geo.region.length > 0) {
+          parts.push(geoCn(geo.region));
+        }
+        if (geo.city !== undefined && geo.city.length > 0) {
+          parts.push(geoCn(geo.city));
+        }
+        if (ip.length > 0) {
+          const loc2: string = Index.shortLoc(parts.join(' '));
+          const body: string = '出口 ' + Index.shortIp(ip) + (loc2.length > 0 ? ' · ' + loc2 : '');
+          return { text: body, suspect: code === 'CN' };
+        }
+      } catch (err) {
+        return { text: '', suspect: false };
+      }
+    }
+    return { text: '', suspect: false };
   }
 
   /**
@@ -1461,6 +1779,9 @@ struct Index {
       this.running = false;
       this.statusText = '未连接';
       this.trafficText = '';
+      this.exitSeq++;
+      this.exitBusy = false;
+      this.exitInfo = '';
       FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
       FileStore.appendLog(this.filesDir,
         'disconnect done, stopped=' + String(stopped));
@@ -1630,8 +1951,9 @@ struct Index {
     .height('100%')
   }
 
+  /** 节点行的正文（名称 / 延迟 / 地址），两种卡片共用 */
   @Builder
-  nodeRow(row: NodeRow) {
+  nodeContent(row: NodeRow) {
     Column({ space: 4 }) {
       Row({ space: 6 }) {
         Text(row.name).fontSize(17).maxLines(1).layoutWeight(1)
@@ -1657,51 +1979,168 @@ struct Index {
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .padding(12)
-    .borderRadius(10)
-    .backgroundColor(row.selected ? '#EAF1FF' : '#F5F5F5')
-    // 整张卡片都能点选，而不是只有文字那一小条
-    .onClick(() => {
-      this.selectNode(row.nodeIndex);
-    })
+  }
+
+  @Builder
+  nodeRow(row: NodeRow) {
+    if (row.groupKey.length === 0) {
+      // 手动节点：一张一张独立的卡片
+      Column() {
+        this.nodeContent(row)
+      }
+      .width('100%')
+      .padding(12)
+      .borderRadius(10)
+      .backgroundColor(row.selected ? '#EAF1FF' : '#F5F5F5')
+      .margin({ top: 8 })
+      .onClick(() => {
+        this.selectNode(row.nodeIndex);
+      })
+    } else {
+      // 订阅组：同组节点连成一整块，和上面的组头共用一块底色
+      Column() {
+        this.nodeContent(row)
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+      .borderRadius({
+        topLeft: row.firstInBlock ? 12 : 0,
+        topRight: row.firstInBlock ? 12 : 0,
+        bottomLeft: row.lastInBlock ? 12 : 0,
+        bottomRight: row.lastInBlock ? 12 : 0
+      })
+      .backgroundColor(row.selected ? '#E3ECFF' : '#F5F7FC')
+      .onClick(() => {
+        this.selectNode(row.nodeIndex);
+      })
+    }
   }
 
   @Builder
   groupHeaderRow(row: NodeRow) {
-    Row({ space: 10 }) {
-      Text(row.groupKey.length > 0 ? (row.groupOpen ? '▾ ' : '▸ ') + row.groupTitle : row.groupTitle)
-        .fontSize(15)
-        .fontColor('#5A5A5A')
-        .layoutWeight(1)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .onClick(() => {
-          this.toggleKey(row.groupKey);
-        })
-      if (this.sortByDelay && row.groupCount > 1) {
-        Text('↓ 延迟')
-          .fontSize(13)
-          .fontColor('#2E7D32')
-      }
-      Text(String(row.groupCount) + ' 个')
-        .fontSize(14)
-        .fontColor('#8C8C8C')
-        .onClick(() => {
-          this.toggleKey(row.groupKey);
-        })
-      if (row.groupKey.length > 0) {
-        Text('更新').fontSize(14).fontColor('#0A59F7')
+    // 手动节点组只有一个「测速」，压成一行；订阅组要放改名/更新/测速，用两行，
+    // 免得标题被按钮挤成「订阅 · …」，改名后自己也看不全
+    if (row.groupKey.length === 0) {
+      Row({ space: 10 }) {
+        Text(row.groupTitle)
+          .fontSize(17)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#2E2E2E')
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
           .onClick(() => {
-            this.refreshGroup(row.groupKey);
+            this.toggleKey(row.groupKey);
           })
-      }
-      Text('测速').fontSize(14).fontColor('#0A59F7')
+        Text(String(row.groupCount) + ' 个')
+          .fontSize(13)
+          .fontColor('#5F6B7A')
+        Row() {
+          Image($r('app.media.ic_bolt')).width(20).height(20).objectFit(ImageFit.Contain)
+        }
+        .width(36)
+        .height(36)
+        .justifyContent(FlexAlign.Center)
+        .backgroundColor('#D8E6FF')
+        .borderRadius(18)
+        .border({ width: 1, color: '#C2D8FF' })
         .onClick(() => {
           this.testGroupByKey(row.groupKey);
         })
+      }
+      .width('100%')
+      .padding({ left: 4, right: 8, top: 8, bottom: 6 })
+      .margin({ top: 10 })
+    } else {
+      Column() {
+        Row({ space: 7 }) {
+          Text(row.groupOpen ? '▾' : '▸')
+            .fontSize(24)
+            .fontColor('#2E2E2E')
+            .height(34)
+            .width(30)
+            .textAlign(TextAlign.Center)
+            .onClick(() => {
+              this.toggleKey(row.groupKey);
+            })
+          Text(row.groupTitle)
+            .fontSize(17)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#2E2E2E')
+            .layoutWeight(1)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .onClick(() => {
+              this.toggleKey(row.groupKey);
+            })
+          if (this.sortByDelay && row.groupCount > 1) {
+            Text('↓')
+              .fontSize(15)
+              .fontColor('#2E7D32')
+          }
+          Text(String(row.groupCount) + ' 个')
+            .fontSize(13)
+            .fontColor('#5F6B7A')
+            .onClick(() => {
+              this.toggleKey(row.groupKey);
+            })
+
+          // 改名：铅笔（描边轮廓 + 笔尖分界线）
+          Row() {
+            Image($r('app.media.ic_pencil')).width(20).height(20).objectFit(ImageFit.Contain)
+          }
+          .width(36)
+          .height(36)
+          .justifyContent(FlexAlign.Center)
+          .backgroundColor('#F1F5FF')
+          .borderRadius(18)
+          .border({ width: 1, color: '#DCE7FF' })
+          .onClick(() => {
+            this.openRename(row.groupKey);
+          })
+
+          // 更新：半圆箭头
+          Row() {
+            Image($r('app.media.ic_refresh')).width(20).height(20).objectFit(ImageFit.Contain)
+          }
+          .width(36)
+          .height(36)
+          .justifyContent(FlexAlign.Center)
+          .backgroundColor('#F1F5FF')
+          .borderRadius(18)
+          .border({ width: 1, color: '#DCE7FF' })
+          .onClick(() => {
+            this.refreshGroup(row.groupKey);
+          })
+
+          // 测速：闪电
+          Row() {
+            Image($r('app.media.ic_bolt')).width(20).height(20).objectFit(ImageFit.Contain)
+          }
+          .width(36)
+          .height(36)
+          .justifyContent(FlexAlign.Center)
+          .backgroundColor('#D8E6FF')
+          .borderRadius(18)
+          .border({ width: 1, color: '#C2D8FF' })
+          .onClick(() => {
+            this.testGroupByKey(row.groupKey);
+          })
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+      .margin({ top: 10 })
+      // 整块底色：组头和组内节点同色，连起来就是一块卡片，组与组之间一眼分得开
+      .backgroundColor('#F5F7FC')
+      .borderRadius({
+        topLeft: 12,
+        topRight: 12,
+        bottomLeft: row.lastInBlock ? 12 : 0,
+        bottomRight: row.lastInBlock ? 12 : 0
+      })
     }
-    .width('100%')
-    .padding({ left: 4, right: 4, top: 8, bottom: 4 })
   }
 
   @Builder
@@ -1713,9 +2152,9 @@ struct Index {
     }
     .width('100%')
     .justifyContent(FlexAlign.Center)
-    .padding(12)
-    .backgroundColor('#F0F4FF')
-    .borderRadius(10)
+    .padding({ top: 10, bottom: 12 })
+    .backgroundColor('#F5F7FC')
+    .borderRadius({ bottomLeft: 12, bottomRight: 12 })
     .onClick(() => {
       this.moreNodes(row.groupKey);
     })
@@ -2133,6 +2572,69 @@ struct Index {
     .backgroundColor('#FFFFFF')
   }
 
+  @Builder
+  renamePanel() {
+    Column() {
+      Scroll() {
+        Column({ space: 12 }) {
+          Text('重命名分组').fontSize(19).fontWeight(FontWeight.Bold).width('100%')
+
+          Text('给这个订阅分组起个好认的名字（比如「香港 3 条」「便宜机场」）。只改显示，不影响订阅和节点本身。')
+            .fontSize(13)
+            .fontColor('#7A7A7A')
+            .width('100%')
+
+          Row({ space: 8 }) {
+            Text('默认').fontSize(14).width(56).fontColor('#8C8C8C')
+            Text(Index.subTitle(this.renameKey))
+              .fontSize(14)
+              .fontColor('#8C8C8C')
+              .layoutWeight(1)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }.width('100%')
+
+          TextInput({ text: this.renameText, placeholder: '新名字，留空则恢复默认' })
+            .width('100%')
+            .height(46)
+            .fontSize(16)
+            .onChange((v: string) => {
+              this.renameText = v;
+            })
+
+          Text('留空后保存 = 恢复成上面的默认名').fontSize(12).fontColor('#9A9A9A').width('100%')
+
+          Row({ space: 12 }) {
+            Button('取消')
+              .layoutWeight(1)
+              .height(46)
+              .fontSize(16)
+              .backgroundColor('#F0F0F0')
+              .fontColor('#333333')
+              .onClick(() => {
+                this.closeRename();
+              })
+            Button('保存')
+              .layoutWeight(1)
+              .height(46)
+              .fontSize(16)
+              .onClick(() => {
+                this.saveRename();
+              })
+          }.width('100%')
+        }
+        .width('100%')
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .align(Alignment.Top)
+    }
+    .padding(16)
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#FFFFFF')
+  }
+
   build() {
     Stack() {
       Column({ space: 8 }) {
@@ -2156,13 +2658,47 @@ struct Index {
         .borderRadius(14)
         .backgroundColor('#8B3A3A')
 
-        Row({ space: 12 }) {
-          Text(this.statusText).fontSize(15).fontColor(this.running ? '#2E7D32' : '#5A5A5A')
-          Text(this.trafficText).fontSize(15).fontColor('#0A59F7')
-          if (this.testInfo.length > 0) {
-            Text(this.testInfo).fontSize(15).fontColor('#E84026')
+        Column({ space: 8 }) {
+          Row({ space: 10 }) {
+            Text(this.statusText).fontSize(15).fontColor(this.running ? '#2E7D32' : '#5A5A5A')
+            Blank()
+            Text(this.trafficText).fontSize(15).fontColor('#0A59F7')
+            if (this.testInfo.length > 0) {
+              Text(this.testInfo).fontSize(15).fontColor('#E84026')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
           }
-        }.width('100%')
+          .width('100%')
+          // 状态行自己一块：已连接浅绿、未连接浅灰，带描边和阴影，一眼看到现在是什么状态
+          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+          .borderRadius(10)
+          .backgroundColor(this.running ? '#EAF6EA' : '#F2F3F5')
+          .border({ width: 1, color: this.running ? '#CFE8CF' : '#E2E4E8' })
+          .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
+
+          if (this.running) {
+            // 出口 IP + 国家地区单独占一行：和流量挤在一起时地区会被省略掉
+            Text(this.exitInfo.length > 0 ? this.exitInfo : (this.exitBusy ? '正在测出口 IP…' : '点此测出口 IP'))
+              .fontSize(14)
+              .fontColor(this.exitInfo.length > 0 ? '#2E7D32' : '#7A7A7A')
+              .width('100%')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+              .borderRadius(10)
+              .backgroundColor('#EAF6EA')
+              .border({ width: 1, color: '#CFE8CF' })
+              .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
+              .onClick(() => {
+                if (!this.exitBusy) {
+                  this.refreshExit(1);
+                }
+              })
+          }
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
 
         Row({ space: 10 }) {
           Button('添加节点').layoutWeight(1).height(38).fontSize(15)
@@ -2178,7 +2714,7 @@ struct Index {
             })
         }.width('100%')
 
-        List({ space: 8 }) {
+        List({ space: 0 }) {
           // LazyForEach：只创建屏幕内可见的行，几百个节点也不会拖慢主线程
           LazyForEach(this.dataSource, (row: NodeRow) => {
             if (row.kind === 1) {
@@ -2198,7 +2734,7 @@ struct Index {
               }
               .width('100%')
             }
-          }, (row: NodeRow) => row.key + (row.selected ? '|1' : '|0'))
+          }, (row: NodeRow) => this.rowKey(row))
         }
         .layoutWeight(1)
         .width('100%')
@@ -2251,6 +2787,10 @@ struct Index {
 
       if (this.editing >= 0) {
         this.editPanel()
+      }
+
+      if (this.renameKey.length > 0) {
+        this.renamePanel()
       }
     }
     .width('100%')

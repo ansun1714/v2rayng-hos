@@ -448,7 +448,10 @@ export class ConfigBuilder {
     });
     lines.push('');
     lines.push('rules:');
-    // 规则由设置页维护（手动编辑 / 文件导入 / 网址订阅），按顺序生效
+    // 出口 IP 查询域名固定走代理：这几条必须排在最前。
+    // 否则「绕过中国域名/中国 IP」会把它们判成直连，测回来的是本地宽带地址，不是节点出口。
+    lines.push('  - DOMAIN-SUFFIX,ipip.net,PROXY');
+    lines.push('  - DOMAIN-SUFFIX,ip.sb,PROXY');
     const active: RuleItem[] = rules.filter((rule: RuleItem) => rule.enabled);
     if (active.length === 0) {
       // 兜底：规则文件被清空也不能让内核直接放行全部流量
