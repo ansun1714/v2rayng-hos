@@ -161,13 +161,7 @@ jobs:
                   -H "Authorization: Bearer ${GH_TOKEN_FOR_ASSETS}" \
                   -H "Accept: application/vnd.github+json" \
                   "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/hvigor-${HVIGOR_VER}" \
-                  | PKG="$pkg" python3 -c "
-import json,os,sys
-name='ohos-%s-%s.tgz' % (os.environ['PKG'], os.environ['HVIGOR_VER'])
-d=json.load(sys.stdin)
-m=[a for a in d.get('assets',[]) if a['name']==name]
-print(m[0]['url'] if m else '')
-")" || true
+                  | jq -r --arg n "ohos-$pkg-${HVIGOR_VER}.tgz" '.assets[] | select(.name==$n) | .url' | head -n 1)" || true
                 if [ -z "${asset_url:-}" ]; then
                   echo "::error::cannot locate release asset for $pkg"
                   exit 1
