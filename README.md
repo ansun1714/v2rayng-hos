@@ -6,6 +6,8 @@
 > **非官方项目。** 本项目与 v2rayNG、mihomo 项目及其作者没有隶属关系，是个人在鸿蒙平台上的一次移植实践，
 > 借用的是它们的设计思路、内核与协议实现。上游致谢见 [CREDITS.md](CREDITS.md)。
 
+[![build-unsigned-hap](https://github.com/ansun1714/v2rayng-hos/actions/workflows/build-hap.yml/badge.svg)](https://github.com/ansun1714/v2rayng-hos/actions/workflows/build-hap.yml)
+
 ## 界面
 
 | 分流规则面板 | 规则分页（社区大规则集） | 左侧抽屉 |
@@ -105,6 +107,21 @@ app/                            鸿蒙工程（hvigor / ArkTS）
 core-native/                     Go 内核桥接（mihomo 依赖）
 tools/                          命令行构建脚本
 ```
+
+## 自动化构建（GitHub Actions）
+
+不想在本机配鸿蒙环境，直接让 GitHub 编：`.github/workflows/build-hap.yml` 在推送到 `main`、
+提 PR、或手动 `workflow_dispatch` 时跑一遍，产出**未签名**的 HAP。
+
+流程：装 Node 20 + JDK 17 → 拉 OpenHarmony SDK（`5.0.3-Release`，API 15，缓存全量包）→
+`npm ci` → `hvigor --mode module -p module=entry@default -p product=default assembleHap` →
+把 `entry-default-unsigned.hap` 作为 artifact 上传。
+
+- **下载位置**：对应 run 的页面 → Artifacts → `unsigned-hap-api15`（保留 30 天）
+- **为什么一定没签名**：`app/build-profile.json5` 里 `signingConfigs` 是空数组，hvigor 只会产出未签名包
+- **耗时**：首次约 10 分钟（要下 4.3GB SDK），之后命中缓存约 2 分钟
+- **签名**：下下来后按下面「签名与装机」一节自己签；不签名的包无法直接安装
+- **产物大小**：约 78MB（不含 `geoip.dat` / `geosite.dat`，这两个数据文件不入库）
 
 ## 构建
 

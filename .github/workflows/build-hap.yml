@@ -1,0 +1,136 @@
+name: build-unsigned-hap
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: hvigor assembleHap (unsigned)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OHOS_SDK_RELEASE: "5.0.3-Release"
+      SDK_API: "15"
+      SDK_ROOT: ${{ github.workspace }}/.ohos-sdk
+      HAP_MODULE: "entry@default"
+      HAP_PRODUCT: "default"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # SDK 约 4.3GB，缓存在 ~/.ohos-sdk 下，命中后跳过下载
+      - name: Cache OpenHarmony SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SDK_ROOT }}/${{ env.SDK_API }}
+          key: ohos-sdk-${{ env.OHOS_SDK_RELEASE }}-api${{ env.SDK_API }}-linux-v1
+
+      - name: Download OpenHarmony SDK (cache miss)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          url="https://repo.huaweicloud.com/openharmony/os/${OHOS_SDK_RELEASE}/ohos-sdk-windows_linux-public.tar.gz"
+          echo "== downloading =="
+          echo "$url"
+          curl -fSL --retry 5 --retry-delay 15 --connect-timeout 30 \
+               -o /tmp/ohos-sdk.tar.gz "$url"
+          ls -lh /tmp/ohos-sdk.tar.gz
+          df -h /tmp | tail -n 1
+
+          echo "== extracting (linux part only) =="
+          mkdir -p /tmp/sdk-x
+          tar -xzf /tmp/ohos-sdk.tar.gz -C /tmp/sdk-x
+
+          linux_dir="$(find /tmp/sdk-x -maxdepth 4 -type d -name linux -print -quit)"
+          if [ -z "$linux_dir" ]; then
+            echo "::error::no 'linux' directory inside archive"
+            find /tmp/sdk-x -maxdepth 3 -type d | head -n 40
+            exit 1
+          fi
+          echo "linux sdk dir: $linux_dir"
+
+          # 包的两种形态：linux/ 下直接是 ets|js|native|previewer|toolchains，
+          # 或 linux/<api>/ets...；统一整理成 <SDK_ROOT>/<api>/ 结构（与本机 DevEco 一致）
+          src="$linux_dir"
+          if [ -d "$linux_dir/${SDK_API}" ]; then
+            src="$linux_dir/${SDK_API}"
+          fi
+
+          mkdir -p "$SDK_ROOT/${SDK_API}"
+          cp -a "$src"/. "$SDK_ROOT/${SDK_API}/"
+          rm -rf /tmp/sdk-x /tmp/ohos-sdk.tar.gz
+
+          echo "== sdk layout =="
+          ls "$SDK_ROOT/${SDK_API}"
+          du -sh "$SDK_ROOT/${SDK_API}"
+
+      - name: Install hvigor dependencies
+        run: |
+          set -euo pipefail
+          npm config set registry https://repo.harmonyos.com/npm/
+          npm config set fetch-retries 5
+          cd app
+          npm ci --no-audit --no-fund
+          ls node_modules/@ohos/hvigor/bin/
+
+      - name: Build HAP (no signing config => unsigned)
+        run: |
+          set -euo pipefail
+          export OHOS_BASE_SDK_HOME="$SDK_ROOT"
+          export OHOS_SDK_HOME="$SDK_ROOT"
+          export PATH="$SDK_ROOT/${SDK_API}/toolchains:$PATH"
+          export NODE_OPTIONS="--max-old-space-size=8192"
+          cd app
+          node node_modules/@ohos/hvigor/bin/hvigor.js \
+            --mode module \
+            -p "module=${HAP_MODULE}" \
+            -p "product=${HAP_PRODUCT}" \
+            assembleHap --no-daemon
+
+          echo "== build outputs =="
+          find entry/build -name "*.hap" -type f -exec ls -lh {} \;
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find app/entry/build -name "*.hap" -type f -exec cp -v {} out/ \;
+          echo "== collected =="
+          ls -lh out
+          # 记录供 README / release 使用
+          for f in out/*.hap; do
+            echo "$(basename "$f") $(stat -c%s "$f") bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload unsigned HAP
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-hap-api${{ env.SDK_API }}
+          path: out/*.hap
+          if-no-files-found: error
+          retention-days: 30
