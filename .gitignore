@@ -15,9 +15,8 @@
 app/local.properties
 # 内置节点列表：仓库只保留示例，真实节点不要提交
 app/entry/src/main/resources/rawfile/nodes.txt
-# geoip / geosite 数据（约 28MB，来自 Loyalsoldier/v2ray-rules-dat，按需下载）
-app/entry/src/main/resources/rawfile/geoip.dat
-app/entry/src/main/resources/rawfile/geosite.dat
+# geoip / geosite 数据随仓库分发（约 28MB，来自 Loyalsoldier/v2ray-rules-dat），
+# 否则 CI 与 clone 后的构建都会缺分流数据，故不再忽略
 # 个人版专属背景图（只在本地构建里用，不进公开仓库）
 app/entry/src/main/resources/base/media/personal_bg.png
 app/entry/src/main/resources/base/media/personal_icon.png

@@ -213,30 +213,6 @@ jobs:
           test -f "$SDK_ROOT/${SDK_API}/ets/api/@ohos.net.vpnExtension.d.ts"
           echo "patch applied"
 
-      # 分流用的 geoip.dat / geosite.dat 约 28MB，按 .gitignore 不入库，
-      # 但缺了它们内核首次连接要自己联网下载才生效，所以构建前从上游拉一份打进 rawfile。
-      # 上游 release CDN 会偶发 504，拉不下来时降级为不带 geo 数据（构建继续）。
-      - name: Fetch geo data (geoip/geosite)
-        run: |
-          set -euo pipefail
-          dest="app/entry/src/main/resources/rawfile"
-          mkdir -p "$dest"
-          for n in geoip.dat geosite.dat; do
-            url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$n"
-            echo "== $n =="
-            if curl -fSL --retry 8 --retry-delay 10 --retry-all-errors --max-time 900 \
-                 -o "$dest/$n" "$url"; then
-              size="$(stat -c%s "$dest/$n")"
-              echo "  $n: $size bytes"
-              echo "- geo data: \`$n\` $size bytes" >> "$GITHUB_STEP_SUMMARY"
-            else
-              rm -f "$dest/$n"
-              echo "::warning::$n download failed; HAP will not bundle geo data"
-              echo "- geo data: \`$n\` MISSING (upstream download failed)" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-          ls -lh "$dest" || true
-
       - name: Build HAP (no signing config => unsigned)
         run: |
           set -euo pipefail

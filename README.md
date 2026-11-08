@@ -136,8 +136,7 @@ tools/                          命令行构建脚本
 - **为什么一定没签名**：`app/build-profile.json5` 里 `signingConfigs` 是空数组，hvigor 只会产出未签名包
 - **耗时**：首次约 10 分钟（要下 4.3GB SDK），之后命中缓存约 2 分钟
 - **签名**：下下来后按下面「签名与装机」一节自己签；不签名的包无法直接安装
-- **产物大小**：约 78MB（含构建前从 Loyalsoldier/v2ray-rules-dat 拉取的 `geoip.dat` / `geosite.dat`；
-  这两个数据文件本身不入库，上游拉取失败时会退化成约 51MB 的版本，并保留原有的运行时下载路径）
+- **产物大小**：约 78MB（含随仓库分发的 `geoip.dat` / `geosite.dat` 分流数据）
 
 ## 构建
 
@@ -165,10 +164,11 @@ Copy-Item entry/src/main/resources/rawfile/nodes.txt.example entry/src/main/reso
 # 然后把里面的示例链接换成你自己的，或者直接不建这个文件
 ```
 
-**3. 准备 geo 数据（可选，但分流规则需要）**
+**3. geo 数据（仓库已随附，通常不用管）**
 
-`geoip.dat` / `geosite.dat` 不入库（约 28MB，来自 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)）。
-把它们放到 `app/entry/src/main/resources/rawfile/` 即可；缺这两个文件时 `GEOSITE`/`GEOIP` 规则不生效。
+`geoip.dat` / `geosite.dat`（约 28MB，来自 [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)）
+已随仓库分发在 `app/entry/src/main/resources/rawfile/`。要更新到最新版本，自行替换这两个文件即可；
+缺失时 `GEOSITE`/`GEOIP` 规则不生效，内核会尝试联网下载。
 
 **4. 编译内核库（仓库已附带预编译产物，可跳过）**
 
@@ -237,7 +237,7 @@ hdc install -r entry-default-signed.hap
 - **[2dust/v2rayNG](https://github.com/2dust/v2rayNG)** — 界面结构与交互参考（分组、测速、路由设置）
 - **[2dust/v2rayN](https://github.com/2dust/v2rayN)** — 分流规则语义与「路由设置」面板的参照
 - **[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo)** — 网络内核，本项目以 Go module `v1.19.33` 依赖并交叉编译为 `libngcore.so`
-- **[Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)** — `geoip.dat` / `geosite.dat` 数据来源（未随仓库分发，自行下载）
+- **[Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)** — `geoip.dat` / `geosite.dat` 数据来源（随仓库分发）
 - **[Loyalsoldier/clash-rules](https://github.com/Loyalsoldier/clash-rules)** — rule-provider payload 清单格式的兼容目标
 - **[ACL4SSR/ACL4SSR](https://github.com/ACL4SSR/ACL4SSR)** — 社区规则集格式与命名习惯的参照
 - **[v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)** — geosite 数据的上游
