@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SDK_ROOT }}/${{ env.SDK_API }}
-          key: ohos-sdk-${{ env.OHOS_SDK_RELEASE }}-api${{ env.SDK_API }}-linux-v1
+          key: ohos-sdk-${{ env.OHOS_SDK_RELEASE }}-api${{ env.SDK_API }}-linux-v2
 
       - name: Download OpenHarmony SDK (cache miss)
         if: steps.sdk-cache.outputs.cache-hit != 'true'
@@ -58,16 +58,17 @@ jobs:
           set -euo pipefail
           url="https://repo.huaweicloud.com/openharmony/os/${OHOS_SDK_RELEASE}/ohos-sdk-windows_linux-public.tar.gz"
           echo "== downloading =="
-          echo "$url"
           curl -fSL --retry 5 --retry-delay 15 --connect-timeout 30 \
                -o /tmp/ohos-sdk.tar.gz "$url"
           ls -lh /tmp/ohos-sdk.tar.gz
           df -h /tmp | tail -n 1
 
-          echo "== extracting (linux part only) =="
+          echo "== extracting tar =="
           mkdir -p /tmp/sdk-x
           tar -xzf /tmp/ohos-sdk.tar.gz -C /tmp/sdk-x
+          rm -f /tmp/ohos-sdk.tar.gz   # 4.3GB，先释放
 
+          # 包结构：ohos-sdk/linux/{ets,js,native,previewer,toolchains}-linux-x64-<ver>-Release.zip
           linux_dir="$(find /tmp/sdk-x -maxdepth 4 -type d -name linux -print -quit)"
           if [ -z "$linux_dir" ]; then
             echo "::error::no 'linux' directory inside archive"
@@ -76,20 +77,59 @@ jobs:
           fi
           echo "linux sdk dir: $linux_dir"
 
-          # 包的两种形态：linux/ 下直接是 ets|js|native|previewer|toolchains，
-          # 或 linux/<api>/ets...；统一整理成 <SDK_ROOT>/<api>/ 结构（与本机 DevEco 一致）
-          src="$linux_dir"
-          if [ -d "$linux_dir/${SDK_API}" ]; then
-            src="$linux_dir/${SDK_API}"
+          mkdir -p "$SDK_ROOT/${SDK_API}"
+          shopt -s nullglob
+          zips=("$linux_dir"/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::no component zips in $linux_dir"
+            ls -la "$linux_dir"
+            exit 1
           fi
 
-          mkdir -p "$SDK_ROOT/${SDK_API}"
-          cp -a "$src"/. "$SDK_ROOT/${SDK_API}/"
-          rm -rf /tmp/sdk-x /tmp/ohos-sdk.tar.gz
+          for z in "${zips[@]}"; do
+            echo "== unzip $(basename "$z") =="
+            unzip -l "$z" | head -n 12
+            unzip -q -o "$z" -d "$SDK_ROOT/${SDK_API}"
+            rm -f "$z"     # 边解压边删，控制磁盘占用
+          done
+
+          # manifest 里有各组件版本与许可信息，一并放到 SDK 根
+          manifest="$(find /tmp/sdk-x -maxdepth 3 -name 'manifest_tag.xml' -print -quit || true)"
+          if [ -n "$manifest" ]; then
+            cp -f "$manifest" "$SDK_ROOT/${SDK_API}/manifest_tag.xml" || true
+            cp -f "$manifest" "$SDK_ROOT/manifest_tag.xml" || true
+          fi
+          rm -rf /tmp/sdk-x
+
+          # 布局自愈：zip 内若多包一层（<api>/ets 或 ets/ets），拍平
+          if [ -d "$SDK_ROOT/${SDK_API}/${SDK_API}" ]; then
+            echo "flattening nested ${SDK_API}/"
+            cp -a "$SDK_ROOT/${SDK_API}/${SDK_API}/." "$SDK_ROOT/${SDK_API}/"
+            rm -rf "$SDK_ROOT/${SDK_API}/${SDK_API}"
+          fi
+          for c in ets js native previewer toolchains; do
+            if [ -d "$SDK_ROOT/${SDK_API}/$c/$c" ]; then
+              echo "flattening nested $c/$c"
+              mv "$SDK_ROOT/${SDK_API}/$c/$c" "$SDK_ROOT/${SDK_API}/$c.tmp"
+              rm -rf "$SDK_ROOT/${SDK_API}/$c"
+              mv "$SDK_ROOT/${SDK_API}/$c.tmp" "$SDK_ROOT/${SDK_API}/$c"
+            fi
+          done
 
           echo "== sdk layout =="
-          ls "$SDK_ROOT/${SDK_API}"
+          ls -la "$SDK_ROOT/${SDK_API}"
+          for c in ets js native previewer toolchains; do
+            if [ -f "$SDK_ROOT/${SDK_API}/$c/oh-uni-package.json" ]; then
+              echo "$c: ok"
+            else
+              echo "$c: MISSING oh-uni-package.json"
+              ls -la "$SDK_ROOT/${SDK_API}/$c" 2>/dev/null | head -n 10 || true
+            fi
+          done
           du -sh "$SDK_ROOT/${SDK_API}"
+
+          test -f "$SDK_ROOT/${SDK_API}/ets/oh-uni-package.json"
+          test -d "$SDK_ROOT/${SDK_API}/toolchains"
 
       # hvigor 的 tarball 自带全部依赖（bundled deps），解压即可，不需要 npm 解析依赖树
       - name: Install hvigor (tarballs from release)
