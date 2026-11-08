@@ -92,8 +92,15 @@ jobs:
       - name: Install hvigor dependencies
         run: |
           set -euo pipefail
-          npm config set registry https://repo.harmonyos.com/npm/
+          # @ohos/* 只在华为源有，其它依赖（electron-to-chromium、caniuse-lite 等）
+          # 华为源没有，必须走 npmjs。用 scoped registry 分流，别改全局 registry。
+          npm config set registry https://registry.npmjs.org/
+          npm config set "@ohos:registry" https://repo.harmonyos.com/npm/
           npm config set fetch-retries 5
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
+          echo "registry=$(npm config get registry)"
+          echo "@ohos:registry=$(npm config get "@ohos:registry")"
           cd app
           npm ci --no-audit --no-fund
           ls node_modules/@ohos/hvigor/bin/
