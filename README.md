@@ -113,9 +113,16 @@ tools/                          命令行构建脚本
 不想在本机配鸿蒙环境，直接让 GitHub 编：`.github/workflows/build-hap.yml` 在推送到 `main`、
 提 PR、或手动 `workflow_dispatch` 时跑一遍，产出**未签名**的 HAP。
 
-流程：装 Node 20 + JDK 17 → 拉 OpenHarmony SDK（`5.0.3-Release`，API 15，缓存全量包）→
-`npm ci` → `hvigor --mode module -p module=entry@default -p product=default assembleHap` →
+流程：装 Node 22 + JDK 17 → 拉 OpenHarmony SDK（`5.0.3-Release`，API 15，缓存全量包）→
+从本仓库 Release（tag `hvigor-5.19.8`）下载 hvigor 的两个自包含 tarball 解压到 `node_modules` →
+`hvigor --mode module -p module=entry@default -p product=default assembleHap` →
 把 `entry-default-unsigned.hap` 作为 artifact 上传。
+
+> 为什么不用 npm：`@ohos/hvigor` 与 `@ohos/hvigor-ohos-plugin` 只发布在 `repo.harmonyos.com`，
+> 而 `npm ci` 在干净的 runner 上会因 lock 文件与 bundle 依赖不同步（缺 `fsevents`、
+> `glob-parent`、`engine.io-parser`）而拒绝安装；把 registry 整个指向华为源又会因为
+> `electron-to-chromium` 等包不在该源而 404。这两个 tarball 自带全部 bundled 依赖
+> （14.4MB + 27.7MB），解压即可用，已在本地用同样方式验证能正常 `assembleHap`。
 
 - **下载位置**：对应 run 的页面 → Artifacts → `unsigned-hap-api15`（保留 30 天）
 - **为什么一定没签名**：`app/build-profile.json5` 里 `signingConfigs` 是空数组，hvigor 只会产出未签名包

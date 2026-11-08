@@ -24,17 +24,19 @@ jobs:
       SDK_ROOT: ${{ github.workspace }}/.ohos-sdk
       HAP_MODULE: "entry@default"
       HAP_PRODUCT: "default"
+      HVIGOR_VER: "5.19.8"
+      # @ohos/hvigor 与 @ohos/hvigor-ohos-plugin 只发布在华为源，境外 runner 拉取不稳，
+      # 故把这两个自包含 tarball 镜像到本仓库的 Release（见 tag hvigor-5.19.8）。
+      HVIGOR_RELEASE_BASE: https://github.com/ansun1714/v2rayng-hos/releases/download/hvigor-5.19.8
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: app/package-lock.json
+          node-version: "22"
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -42,7 +44,7 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # SDK 约 4.3GB，缓存在 ~/.ohos-sdk 下，命中后跳过下载
+      # SDK 约 4.3GB，缓存在 workspace 下，命中后跳过下载
       - name: Cache OpenHarmony SDK
         id: sdk-cache
         uses: actions/cache@v4
@@ -89,21 +91,22 @@ jobs:
           ls "$SDK_ROOT/${SDK_API}"
           du -sh "$SDK_ROOT/${SDK_API}"
 
-      - name: Install hvigor dependencies
+      # hvigor 的 tarball 自带全部依赖（bundled deps），解压即可，不需要 npm 解析依赖树
+      - name: Install hvigor (tarballs from release)
         run: |
           set -euo pipefail
-          # @ohos/* 只在华为源有，其它依赖（electron-to-chromium、caniuse-lite 等）
-          # 华为源没有，必须走 npmjs。用 scoped registry 分流，别改全局 registry。
-          npm config set registry https://registry.npmjs.org/
-          npm config set "@ohos:registry" https://repo.harmonyos.com/npm/
-          npm config set fetch-retries 5
-          npm config set fetch-retry-mintimeout 20000
-          npm config set fetch-retry-maxtimeout 120000
-          echo "registry=$(npm config get registry)"
-          echo "@ohos:registry=$(npm config get "@ohos:registry")"
           cd app
-          npm ci --no-audit --no-fund
-          ls node_modules/@ohos/hvigor/bin/
+          rm -rf node_modules
+          for pkg in hvigor hvigor-ohos-plugin; do
+            echo "== $pkg =="
+            mkdir -p "node_modules/@ohos/$pkg"
+            curl -fSL --retry 5 --retry-delay 10 --max-time 300 \
+              "$HVIGOR_RELEASE_BASE/ohos-$pkg-${HVIGOR_VER}.tgz" \
+              | tar -xz -C "node_modules/@ohos/$pkg" --strip-components=1
+            ls "node_modules/@ohos/$pkg" | head -n 8
+          done
+          test -f node_modules/@ohos/hvigor/bin/hvigor.js
+          echo "hvigor installed"
 
       - name: Build HAP (no signing config => unsigned)
         run: |
@@ -129,7 +132,6 @@ jobs:
           find app/entry/build -name "*.hap" -type f -exec cp -v {} out/ \;
           echo "== collected =="
           ls -lh out
-          # 记录供 README / release 使用
           for f in out/*.hap; do
             echo "$(basename "$f") $(stat -c%s "$f") bytes" | tee -a "$GITHUB_STEP_SUMMARY"
           done
