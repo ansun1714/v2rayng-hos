@@ -131,19 +131,59 @@ jobs:
           test -f "$SDK_ROOT/${SDK_API}/ets/oh-uni-package.json"
           test -d "$SDK_ROOT/${SDK_API}/toolchains"
 
-      # hvigor 的 tarball 自带全部依赖（bundled deps），解压即可，不需要 npm 解析依赖树
+      # hvigor 的 tarball 自带全部依赖（bundled deps），解压即可，不需要 npm 解析依赖树。
+      # GitHub Release 的 CDN 偶发 504，这里做本地缓存 + 直链失败时回退到 API asset 下载。
+      - name: Cache hvigor tarballs
+        uses: actions/cache@v4
+        with:
+          path: .hvigor-pkgs
+          key: hvigor-pkgs-${{ env.HVIGOR_VER }}
+
       - name: Install hvigor (tarballs from release)
+        env:
+          GH_TOKEN_FOR_ASSETS: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          mkdir -p .hvigor-pkgs
           cd app
           rm -rf node_modules
           for pkg in hvigor hvigor-ohos-plugin; do
             echo "== $pkg =="
+            tarball="../.hvigor-pkgs/ohos-$pkg-${HVIGOR_VER}.tgz"
+            if [ ! -s "$tarball" ]; then
+              url="$HVIGOR_RELEASE_BASE/ohos-$pkg-${HVIGOR_VER}.tgz"
+              echo "downloading $url"
+              if ! curl -fSL --retry 8 --retry-delay 15 --retry-all-errors --max-time 900 \
+                   -o "$tarball" "$url"; then
+                echo "direct release URL failed, falling back to API asset download"
+                rm -f "$tarball"
+                asset_url="$(curl -sS --retry 5 --retry-all-errors \
+                  -H "Authorization: Bearer ${GH_TOKEN_FOR_ASSETS}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/hvigor-${HVIGOR_VER}" \
+                  | PKG="$pkg" python3 -c "
+import json,os,sys
+name='ohos-%s-%s.tgz' % (os.environ['PKG'], os.environ['HVIGOR_VER'])
+d=json.load(sys.stdin)
+m=[a for a in d.get('assets',[]) if a['name']==name]
+print(m[0]['url'] if m else '')
+")" || true
+                if [ -z "${asset_url:-}" ]; then
+                  echo "::error::cannot locate release asset for $pkg"
+                  exit 1
+                fi
+                curl -fSL --retry 8 --retry-delay 15 --retry-all-errors --max-time 900 \
+                  -H "Authorization: Bearer ${GH_TOKEN_FOR_ASSETS}" \
+                  -H "Accept: application/octet-stream" \
+                  -o "$tarball" "$asset_url"
+              fi
+            else
+              echo "using cached $tarball"
+            fi
+            ls -lh "$tarball"
             mkdir -p "node_modules/@ohos/$pkg"
-            curl -fSL --retry 5 --retry-delay 10 --max-time 300 \
-              "$HVIGOR_RELEASE_BASE/ohos-$pkg-${HVIGOR_VER}.tgz" \
-              | tar -xz -C "node_modules/@ohos/$pkg" --strip-components=1
-            ls "node_modules/@ohos/$pkg" | head -n 8
+            tar -xzf "$tarball" -C "node_modules/@ohos/$pkg" --strip-components=1
+            test -f "node_modules/@ohos/$pkg/package.json"
           done
           test -f node_modules/@ohos/hvigor/bin/hvigor.js
           echo "hvigor installed"
