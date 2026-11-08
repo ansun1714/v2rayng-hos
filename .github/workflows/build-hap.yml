@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SDK_ROOT }}/${{ env.SDK_API }}
-          key: ohos-sdk-${{ env.OHOS_SDK_RELEASE }}-api${{ env.SDK_API }}-linux-v2
+          key: ohos-sdk-${{ env.OHOS_SDK_RELEASE }}-api${{ env.SDK_API }}-linux-v3
 
       - name: Download OpenHarmony SDK (cache miss)
         if: steps.sdk-cache.outputs.cache-hit != 'true'
@@ -147,6 +147,23 @@ jobs:
           done
           test -f node_modules/@ohos/hvigor/bin/hvigor.js
           echo "hvigor installed"
+
+      # OpenHarmony 5.0.3 公共 SDK 里 module.json5 的 schema 枚举与 NetworkKit 导出都没有
+      # vpn 扩展类型，直接构建会报 00303038 Schema validate failed（extensionAbilities[0].type）。
+      # ci/ohos-sdk-patch 下是同一版本 SDK 中对应的 Apache-2.0 文件，覆盖后 hvigor 才能通过
+      # 配置校验并解析 VpnExtensionAbility / vpnExtension。
+      - name: Patch SDK for VPN extension support
+        run: |
+          set -euo pipefail
+          echo "== patch files =="
+          find ci/ohos-sdk-patch -type f | sort
+          cp -a ci/ohos-sdk-patch/. "$SDK_ROOT/${SDK_API}/"
+          test -f "$SDK_ROOT/${SDK_API}/ets/api/@ohos.app.ability.VpnExtensionAbility.d.ts"
+          test -f "$SDK_ROOT/${SDK_API}/ets/api/@ohos.net.vpnExtension.d.ts"
+          test -f "$SDK_ROOT/${SDK_API}/ets/kits/@kit.NetworkKit.d.ts"
+          test -f "$SDK_ROOT/${SDK_API}/toolchains/modulecheck/module.json"
+          echo "schema vpn entries: $(grep -c '\"vpn\"' "$SDK_ROOT/${SDK_API}/toolchains/modulecheck/module.json" || true)"
+          grep -n "VpnExtensionAbility" "$SDK_ROOT/${SDK_API}/ets/kits/@kit.NetworkKit.d.ts" || true
 
       - name: Build HAP (no signing config => unsigned)
         run: |
