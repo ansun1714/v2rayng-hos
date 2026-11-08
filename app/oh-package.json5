@@ -1,0 +1,10 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "v2rayng-ohos",
+  "version": "1.0.0",
+  "description": "v2rayNG for HarmonyOS",
+  "dependencies": {
+  },
+  "devDependencies": {
+  }
+}

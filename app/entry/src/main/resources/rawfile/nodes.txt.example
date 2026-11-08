@@ -1,0 +1,4 @@
+### 内置节点列表（示例）
+### 复制本文件为 nodes.txt 后填入你自己的节点，或直接删掉 nodes.txt（App 会读订阅/手动添加的节点）。
+### 支持 vmess / vless / ss / trojan 链接，一行一个。
+vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&type=ws&security=tls&sni=example.com&fp=chrome&host=example.com&path=%2Fws#示例节点-请替换

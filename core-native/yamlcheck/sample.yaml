@@ -1,0 +1,61 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: off
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+tun:
+  enable: true
+  stack: gvisor
+  device: tun0
+  file-descriptor: 42
+  dns-hijack:
+    - "any:53"
+  auto-route: false
+  auto-detect-interface: false
+  mtu: 1400
+  inet4-address:
+    - 172.19.0.1/30
+
+proxies:
+  - name: "vless-ws-tls"
+    type: vless
+    server: "example.com"
+    port: 443
+    udp: true
+    uuid: "11111111-2222-3333-4444-555555555555"
+    flow: "xtls-rprx-vision"
+    network: ws
+    ws-opts:
+      path: "/ws"
+      headers:
+        Host: "cdn.example.com"
+    tls: true
+    servername: "cdn.example.com"
+    client-fingerprint: "chrome"
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "vless-ws-tls"
+
+rules:
+  - MATCH,PROXY

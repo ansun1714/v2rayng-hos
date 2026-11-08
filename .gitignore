@@ -1,0 +1,43 @@
+# ── 鸿蒙构建产物 ─────────────────────────────────────────
+**/build/
+**/.hvigor/
+**/.cxx/
+**/node_modules/
+**/oh_modules/
+*.hap
+*.p7b
+*.p12
+*.cer
+*.har
+
+# ── 本机环境与私有数据（克隆后自己补） ───────────────────
+# SDK 路径因机器而异
+app/local.properties
+# 内置节点列表：仓库只保留示例，真实节点不要提交
+app/entry/src/main/resources/rawfile/nodes.txt
+# geoip / geosite 数据（约 28MB，来自 Loyalsoldier/v2ray-rules-dat，按需下载）
+app/entry/src/main/resources/rawfile/geoip.dat
+app/entry/src/main/resources/rawfile/geosite.dat
+
+# ── 运行时数据快照 ──────────────────────────────────────
+app/profiles.json
+app/state.json
+app/rules.json
+app/rules-src.txt
+
+# ── Go 内核编译中间产物 ─────────────────────────────────
+core-native/*.so
+core-native/*.bak
+
+# ── 本机临时文件（调试脚本、截图、测试夹具、日志） ──────
+/_*
+/*.jpeg
+/*.jpg
+/*.png
+/*.log
+/*.txt
+/*.json
+sub.txt
+direct*.txt
+big.txt
+rules.yaml

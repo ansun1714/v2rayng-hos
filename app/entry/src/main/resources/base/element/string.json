@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "v2rayNG 鸿蒙版"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "v2rayNG 鸿蒙版主界面"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "v2rayNG"
+    },
+    {
+      "name": "vpn_desc",
+      "value": "v2rayNG VPN 服务"
+    },
+    {
+      "name": "pasteboard_reason",
+      "value": "从剪贴板导入节点分享链接"
+    }
+  ]
+}

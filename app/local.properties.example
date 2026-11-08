@@ -1,0 +1,3 @@
+# OpenHarmony / HarmonyOS SDK 路径，按你本机实际位置修改
+# DevEco Studio 通常会自动生成此文件；命令行构建时手写即可
+sdk.dir=/path/to/ohos/sdk

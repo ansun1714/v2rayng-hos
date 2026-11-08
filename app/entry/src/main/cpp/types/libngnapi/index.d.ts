@@ -1,0 +1,12 @@
+export const start: (configYaml: string, homeDir: string) => string;
+export const stop: () => void;
+export const isRunning: () => boolean;
+export const stats: () => string;
+export const proxyDelay: (name: string, url: string, timeoutMs: number) => string;
+export const proxyDelayAsync: (name: string, url: string, timeoutMs: number, resPath: string, seq: number) => void;
+export const version: () => string;
+export const setProtectHandler: (cb: (id: number, fd: number) => void) => void;
+export const protectDone: (id: number, ok: boolean) => void;
+export const enableCoreLog: () => void;
+export const probeFd: (fd: number) => string;
+export const probeDial: (host: string, port: number, timeoutMs: number) => string;

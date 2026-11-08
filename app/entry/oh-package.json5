@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "v2rayNG for HarmonyOS entry module",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "libngnapi": "file:./src/main/cpp/types/libngnapi"
+  }
+}
