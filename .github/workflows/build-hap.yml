@@ -157,13 +157,27 @@ jobs:
           set -euo pipefail
           echo "== patch files =="
           find ci/ohos-sdk-patch -type f | sort
-          cp -a ci/ohos-sdk-patch/. "$SDK_ROOT/${SDK_API}/"
-          test -f "$SDK_ROOT/${SDK_API}/ets/api/@ohos.app.ability.VpnExtensionAbility.d.ts"
+          # 补丁包内已含 15/ 这一层，目标是 SDK 的 <api>/ 目录
+          cp -a ci/ohos-sdk-patch/15/. "$SDK_ROOT/${SDK_API}/"
+          echo "== verify =="
+          if [ -d "$SDK_ROOT/${SDK_API}/15" ]; then
+            echo "::error::patch created a nested 15/ dir, copy path is wrong"
+            exit 1
+          fi
+          vpn_count="$(grep -c '"vpn"' "$SDK_ROOT/${SDK_API}/toolchains/modulecheck/module.json" || true)"
+          echo "vpn entries in module schema: $vpn_count"
+          if [ "${vpn_count:-0}" -lt 1 ]; then
+            echo "::error::module.json schema still has no vpn type"
+            exit 1
+          fi
+          kit_count="$(grep -c 'vpnExtension' "$SDK_ROOT/${SDK_API}/ets/kits/@kit.NetworkKit.d.ts" || true)"
+          echo "vpnExtension references in @kit.NetworkKit: ${kit_count:-0}"
+          if [ "${kit_count:-0}" -lt 1 ]; then
+            echo "::error::@kit.NetworkKit.d.ts does not export vpnExtension"
+            exit 1
+          fi
           test -f "$SDK_ROOT/${SDK_API}/ets/api/@ohos.net.vpnExtension.d.ts"
-          test -f "$SDK_ROOT/${SDK_API}/ets/kits/@kit.NetworkKit.d.ts"
-          test -f "$SDK_ROOT/${SDK_API}/toolchains/modulecheck/module.json"
-          echo "schema vpn entries: $(grep -c '\"vpn\"' "$SDK_ROOT/${SDK_API}/toolchains/modulecheck/module.json" || true)"
-          grep -n "VpnExtensionAbility" "$SDK_ROOT/${SDK_API}/ets/kits/@kit.NetworkKit.d.ts" || true
+          echo "patch applied"
 
       - name: Build HAP (no signing config => unsigned)
         run: |
