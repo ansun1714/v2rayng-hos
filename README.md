@@ -132,7 +132,13 @@ tools/                          命令行构建脚本
 > `electron-to-chromium` 等包不在该源而 404。这两个 tarball 自带全部 bundled 依赖
 > （14.4MB + 27.7MB），解压即可用，已在本地用同样方式验证能正常 `assembleHap`。
 
-- **下载位置**：对应 run 的页面 → Artifacts → `unsigned-hap-api15`（保留 30 天）
+- **下载位置**：两种都行
+  - Releases 页（推荐）：每次 push 构建成功后由 Actions 自动发布到
+    `https://github.com/ansun1714/v2rayng-hos/releases/tag/hap-latest`，
+    资产固定叫 `entry-default-unsigned.hap`，正文里有大小、SHA256 与对应 run
+  - Actions 对应 run 的页面 → Artifacts → `v2rayng-ohos-unsigned-hap-api15`（保留 30 天，同一份产物打成 zip）
+  - Release 里的 `hvigor-5.19.8` 是 **prerelease**，只放 CI 需要的 hvigor tarball，不是应用成品
+
 - **为什么一定没签名**：`app/build-profile.json5` 里 `signingConfigs` 是空数组，hvigor 只会产出未签名包
 - **耗时**：首次约 10 分钟（要下 4.3GB SDK），之后命中缓存约 2 分钟
 - **签名**：下下来后按下面「签名与装机」一节自己签；不签名的包无法直接安装

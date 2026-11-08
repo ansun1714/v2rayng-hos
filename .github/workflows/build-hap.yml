@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # 需要在 tag hap-latest 上创建/更新 Release 并替换资产
 
 jobs:
   build:
@@ -254,3 +254,43 @@ jobs:
           path: out/*.hap
           if-no-files-found: error
           retention-days: 30
+
+      # 把成品直接发到 Releases 页的固定位置（tag hap-latest），换掉同名旧资产。
+      # 这样下载链接永远是 releases/download/hap-latest/entry-default-unsigned.hap，
+      # 不用每次都翻 Actions 页面找 run。PR 来自 fork 时没有写权限，跳过。
+      - name: Publish HAP to release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          hap="out/entry-default-unsigned.hap"
+          size="$(stat -c%s "$hap")"
+          sha="$(sha256sum "$hap" | cut -d' ' -f1)"
+          short_sha="$(git rev-parse --short HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+
+          body="$(printf '由 GitHub Actions 在云端自动构建，**未签名**，需要自己签一次名再侧载。\n\n| 项 | 值 |\n| --- | --- |\n| 文件 | `entry-default-unsigned.hap` |\n| 大小 | %s 字节 |\n| SHA256 | `%s` |\n| 构建 | [run #%s](%s/%s/actions/runs/%s) · `%s` |\n| 构建时间 | %s |\n\n包里含 mihomo 内核 `libngcore.so`、NAPI 桥 `libngnapi.so`、`libc++_shared.so`，以及分流数据 `geoip.dat` / `geosite.dat`。\n\n签名与装机步骤见 README「签名与装机」。CI 自己依赖的 hvigor tarball 在 prerelease `hvigor-5.19.8`，不是应用成品。' "$size" "$sha" "$GITHUB_RUN_NUMBER" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$short_sha" "$built_at")"
+
+          rel_id="$(curl -sS "${auth[@]}" "$api/releases/tags/hap-latest" | jq -r '.id // empty')"
+          if [ -z "$rel_id" ]; then
+            echo "creating release hap-latest"
+            payload="$(jq -n --arg t "hap-latest" --arg n "v2rayNG 鸿蒙版 · 最新未签名 HAP（自动构建）" --arg b "$body" '{tag_name:$t,name:$n,body:$b,draft:false,prerelease:false}')"
+            rel_id="$(curl -sS "${auth[@]}" -H "Content-Type: application/json" -d "$payload" "$api/releases" | jq -r '.id')"
+          else
+            echo "updating release hap-latest (id=$rel_id)"
+            payload="$(jq -n --arg b "$body" '{body:$b}')"
+            curl -sS "${auth[@]}" -X PATCH -H "Content-Type: application/json" -d "$payload" "$api/releases/$rel_id" > /dev/null
+            for aid in $(curl -sS "${auth[@]}" "$api/releases/$rel_id/assets" | jq -r '.[] | select(.name=="entry-default-unsigned.hap") | .id'); do
+              echo "removing old asset $aid"
+              curl -sS "${auth[@]}" -X DELETE "$api/releases/assets/$aid" > /dev/null
+            done
+          fi
+
+          up="$(curl -sS "${auth[@]}" -H "Content-Type: application/octet-stream" \
+                --data-binary "@$hap" \
+                "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${rel_id}/assets?name=entry-default-unsigned.hap")"
+          echo "$up" | jq -r '"published: id=\(.id) size=\(.size) state=\(.state) url=\(.browser_download_url)"'
+          echo "- release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/hap-latest" >> "$GITHUB_STEP_SUMMARY"
