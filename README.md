@@ -136,7 +136,8 @@ tools/                          命令行构建脚本
 - **为什么一定没签名**：`app/build-profile.json5` 里 `signingConfigs` 是空数组，hvigor 只会产出未签名包
 - **耗时**：首次约 10 分钟（要下 4.3GB SDK），之后命中缓存约 2 分钟
 - **签名**：下下来后按下面「签名与装机」一节自己签；不签名的包无法直接安装
-- **产物大小**：约 51MB（不含 `geoip.dat` / `geosite.dat`，这两个数据文件不入库，运行时按需下载）
+- **产物大小**：约 78MB（含构建前从 Loyalsoldier/v2ray-rules-dat 拉取的 `geoip.dat` / `geosite.dat`；
+  这两个数据文件本身不入库，上游拉取失败时会退化成约 51MB 的版本，并保留原有的运行时下载路径）
 
 ## 构建
 
