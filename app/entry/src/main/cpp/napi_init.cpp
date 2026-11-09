@@ -44,18 +44,20 @@ static FnFree g_free = nullptr;
 static FnSetProtectCb g_setProtectCb = nullptr;
 static FnSetLogCb g_setLogCb = nullptr;
 
-// ---- 内核日志桥：Go 侧 log.Subscribe 的回调直接落到 hilog（NG-CORE）----
+// ---- 内核日志桥：Go 侧 log.Subscribe 的回调落到 hilog（NG-CORE）----
+// 只放 error/warn：info 级别会逐条记录连接的目的地址（域名/IP），
+// 落进系统日志等于把访问记录交出去，所以 info/debug 一律丢弃。
 static void GoLog(int level, const char *msg) {
     if (msg == nullptr) {
         return;
     }
-    LogLevel lv = LOG_INFO;
+    LogLevel lv;
     if (level <= 1) {
         lv = LOG_ERROR;
     } else if (level == 2) {
         lv = LOG_WARN;
-    } else if (level >= 4) {
-        lv = LOG_DEBUG;
+    } else {
+        return;
     }
     OH_LOG_Print(LOG_APP, lv, kDomain, "NG-CORE", "%{public}s", msg);
 }

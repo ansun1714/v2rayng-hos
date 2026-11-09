@@ -36,6 +36,13 @@ export class ConfigBuilder {
     return value.replace(/[\r\n"'\\]/g, '').trim();
   }
 
+  /** 允许写入配置的规则类型白名单；表外的 kind 一律丢弃，避免把配置写坏。 */
+  static knownKinds(): string[] {
+    return ['GEOSITE', 'GEOIP', 'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD',
+      'DOMAIN-REGEX', 'IP-CIDR', 'IP-CIDR6', 'SRC-IP-CIDR', 'SRC-PORT', 'DST-PORT',
+      'NETWORK', 'AND', 'OR', 'NOT', 'MATCH'];
+  }
+
   /** 一条规则渲染成 mihomo rules 行；非法或禁用返回空串。 */
   static renderRule(rule: RuleItem): string {
     if (!rule.enabled) {
@@ -52,8 +59,9 @@ export class ConfigBuilder {
     if (value.length === 0) {
       return '';
     }
-    // 括号表达式（AND/NOT/OR）不加其他后缀；IP 类走 no-resolve 避免回落 DNS
-    if (rule.kind === 'IP-CIDR' || rule.kind === 'IP-CIDR6') {
+    // GEOIP 规则必须带 no-resolve：否则内核为了判国别会在本地做一次明文 DNS 查询，
+    // 境外域名的访问目标就白送给运营商了（域名本应交给 GEOSITE 规则判定）。
+    if (rule.kind === 'IP-CIDR' || rule.kind === 'IP-CIDR6' || rule.kind === 'GEOIP') {
       return '  - ' + rule.kind + ',' + value + ',' + target + ',no-resolve';
     }
     return '  - ' + rule.kind + ',' + value + ',' + target;
@@ -204,6 +212,10 @@ export class ConfigBuilder {
         if (kind.length === 0) {
           return;
         }
+        // 外部 JSON 只认白名单内的 kind，其余丢弃（防注入、防整份配置解析失败）
+        if (ConfigBuilder.knownKinds().indexOf(kind) < 0) {
+          return;
+        }
         out.push({
           id: 'i_' + String(i) + '_' + String(Date.now()),
           title: item.title !== undefined && item.title.length > 0 ? item.title : kind + ' ' + item.value,
@@ -255,9 +267,7 @@ export class ConfigBuilder {
       return null;
     }
     // 未知 kind 直接跳过，避免写进内核后整份配置失效
-    const known: string[] = ['GEOSITE', 'GEOIP', 'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD',
-      'DOMAIN-REGEX', 'IP-CIDR', 'IP-CIDR6', 'SRC-IP-CIDR', 'SRC-PORT', 'DST-PORT',
-      'NETWORK', 'AND', 'OR', 'NOT', 'MATCH', 'GEOIP'];
+    const known: string[] = ConfigBuilder.knownKinds();
     if (known.indexOf(kind) < 0) {
       return null;
     }
@@ -381,11 +391,14 @@ export class ConfigBuilder {
   /** 生成完整配置：多节点 + 分组（供测速/切换）+ 规则驱动的分流 + tun fd 占位。 */
   static build(profiles: Profile[], selected: number, rules: RuleItem[]): string {
     const lines: string[] = [];
-    lines.push('mixed-port: 7890');
+    // 只走 tun，不开本地混合端口：allow-lan:false 时它虽只绑 127.0.0.1，
+    // 但本机任意应用都能无认证借道（7890），没必要留这个面。
+    // 也不开 external-controller：界面进程访问不到内核的网络命名空间，
+    // 且无 secret 时 mihomo 默认放开 CORS，属于纯粹多出来的攻击面。
     lines.push('allow-lan: false');
     lines.push('mode: rule');
-    lines.push('log-level: info');
-    lines.push('external-controller: 127.0.0.1:9090');
+    // info 级别会把每条连接的目的地址写进日志，隐私上不可接受，只保留 warning 及以上
+    lines.push('log-level: warning');
     lines.push('ipv6: false');
     lines.push('unified-delay: true');
     lines.push('tcp-concurrent: true');
@@ -405,20 +418,23 @@ export class ConfigBuilder {
     lines.push('    - "+.lan"');
     lines.push('    - "+.local"');
     lines.push('    - "localhost"');
+    // 引导 DNS：只能填 IP（mihomo 用它先把 DoH 服务器域名解析出来），
+    // 这两条是明文但不承载用户查询，只是用来把下面 DoH 的域名解析成 IP。
     lines.push('  default-nameserver:');
     lines.push('    - 223.5.5.5');
     lines.push('    - 119.29.29.29');
-    // 国内域名用手机自己的 DNS（阿里/腾讯），直连解析，不经过代理
+    // 常规解析全部走 DoH，运营商看不到查询内容，应答也没法篡改。
     lines.push('  nameserver:');
-    lines.push('    - 223.5.5.5');
-    lines.push('    - 119.29.29.29');
+    lines.push('    - "https://dns.alidns.com/dns-query"');
+    lines.push('    - "https://doh.pub/dns-query"');
+    // 解析代理服务器域名同样用 DoH（直连，不绕代理，避免自己解析自己）
     lines.push('  proxy-server-nameserver:');
-    lines.push('    - 223.5.5.5');
-    lines.push('    - 119.29.29.29');
+    lines.push('    - "https://dns.alidns.com/dns-query"');
+    lines.push('    - "https://doh.pub/dns-query"');
     lines.push('  nameserver-policy:');
     lines.push('    "geosite:cn":');
-    lines.push('      - 223.5.5.5');
-    lines.push('      - 119.29.29.29');
+    lines.push('      - "https://dns.alidns.com/dns-query"');
+    lines.push('      - "https://doh.pub/dns-query"');
     lines.push('');
     lines.push('tun:');
     lines.push('  enable: true');

@@ -321,6 +321,7 @@ export default class VpnExtAbility extends VpnExtensionAbility {
     // 异步执行：测速期间内核要回调 JS 执行 protect，同步调用会把它堵死
     NgCore.proxyDelayAsync(req.name, req.url !== undefined ? req.url : '', 5000,
       FileStore.delayResPath(filesDir), req.seq);
-    hilog.info(DOMAIN, TAG, 'delay start %{public}s seq=%{public}d', req.name, req.seq);
+    // 节点名可能带机房/地区信息，不写系统日志，只留序号
+    hilog.info(DOMAIN, TAG, 'delay start seq=%{public}d', req.seq);
   }
 }

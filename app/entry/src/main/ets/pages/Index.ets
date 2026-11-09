@@ -12,7 +12,6 @@ import { FileStore } from '../core/FileStore';
 
 const BUNDLE_NAME: string = 'com.maoxu.v2rayng';
 const EXT_ABILITY: string = 'VpnExtAbility';
-const API_BASE: string = 'http://127.0.0.1:9090';
 const TEST_URL: string = 'http://www.gstatic.com/generate_204';
 /** 规则订阅地址的默认值：内置推荐规则集（点「网址更新」即还原默认 6 条）。 */
 const BUILTIN_RULE_SRC: string = 'builtin://default';
@@ -297,8 +296,28 @@ struct Index {
     const pending: string = AppStorage.get<string>('launchImportUri') ?? '';
     if (pending.length > 0) {
       AppStorage.setOrCreate<string>('launchImportUri', '');
-      this.linkInput = pending;
-      this.importFromText();
+      // 任何应用都能通过 Want 拉起本 App 并塞 importUri；直接导入等于让外部应用
+      // 决定你连哪个节点，所以先弹窗确认，用户点了才真正解析。
+      setTimeout(() => {
+        AlertDialog.show({
+          title: '外部导入请求',
+          message: '另一个应用请求导入 ' + String(pending.length) + ' 个字符的节点链接。\n' +
+            '如果这不是你自己发起的，请选择忽略。',
+          autoCancel: true,
+          primaryButton: {
+            value: '忽略',
+            action: () => {
+            }
+          },
+          secondaryButton: {
+            value: '导入',
+            action: () => {
+              this.linkInput = pending;
+              this.importFromText();
+            }
+          }
+        });
+      }, 0);
     }
     this.pollTimer = setInterval(() => {
       this.readState();
@@ -937,7 +956,8 @@ struct Index {
         header: { 'User-Agent': 'v2rayNG-harmony/1.0' }
       });
       if (resp.responseCode !== 200) {
-        hilog.error(0x0001, 'V2rayNG-UI', 'httpGet code=%{public}d url=%{public}s', resp.responseCode, url);
+        // 不打印 url：订阅链接里带 token，落到系统日志等于把凭据写进日志
+        hilog.error(0x0001, 'V2rayNG-UI', 'httpGet code=%{public}d', resp.responseCode);
         return '';
       }
       // 某些版本 result 会是 ArrayBuffer，直接 String() 只会得到 "[object ArrayBuffer]"
@@ -949,8 +969,8 @@ struct Index {
       return decoder.decodeToString(new Uint8Array(raw as ArrayBuffer));
     } catch (err) {
       const be = err as BusinessError;
-      hilog.error(0x0001, 'V2rayNG-UI', 'httpGet fail code=%{public}d msg=%{public}s url=%{public}s',
-        be.code !== undefined ? be.code : -1, String(be.message), url);
+      hilog.error(0x0001, 'V2rayNG-UI', 'httpGet fail code=%{public}d msg=%{public}s',
+        be.code !== undefined ? be.code : -1, String(be.message));
       return '';
     } finally {
       req.destroy();
@@ -1109,8 +1129,14 @@ struct Index {
   /** 订阅导入：支持 base64 或明文的一行一个分享链接，重导时覆盖同源节点。 */
   async importSubscription(): Promise<void> {
     const url: string = this.subInput.trim();
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      this.toast.showToast({ message: '请填写 http(s) 订阅链接' });
+    // 只接受 https：明文 http 会把订阅 token 和节点凭据暴露给同一网络里的任何中间人，
+    // 对方还能改写返回内容，塞进自己的节点或把域名改成直连。
+    if (url.startsWith('http://')) {
+      this.toast.showToast({ message: '订阅地址必须用 https，明文 http 会泄露 token' });
+      return;
+    }
+    if (!url.startsWith('https://')) {
+      this.toast.showToast({ message: '请填写 https 订阅链接' });
       return;
     }
     this.statusText = '正在拉取订阅…';
@@ -1625,14 +1651,19 @@ struct Index {
       this.ruleMsg = '已应用内置推荐规则集 ' + String(this.rules.length) + ' 条';
       return;
     }
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      this.ruleMsg = '请先填写 http(s) 规则订阅地址';
-      this.toast.showToast({ message: '请先填写 http(s) 规则订阅地址' });
+    if (url.startsWith('http://')) {
+      this.ruleMsg = '规则订阅地址必须用 https';
+      this.toast.showToast({ message: '规则订阅地址必须用 https，明文 http 会被篡改' });
       return;
     }
-    this.ruleMsg = '正在拉取 ' + url;
+    if (!url.startsWith('https://')) {
+      this.ruleMsg = '请先填写 https 规则订阅地址';
+      this.toast.showToast({ message: '请先填写 https 规则订阅地址' });
+      return;
+    }
+    this.ruleMsg = '正在拉取规则订阅…';
     const body: string = await this.httpGet(url, 15000);
-    hilog.info(0x0000, 'V2rayNG-UI', 'rule url %{public}s body=%{public}d', url, body.length);
+    hilog.info(0x0000, 'V2rayNG-UI', 'rule fetched, bytes=%{public}d', body.length);
     if (body.trim().length === 0) {
       this.ruleMsg = '拉取失败：没有收到内容（HTTP 未返回或链接不可达）';
       this.toast.showToast({ message: '规则拉取失败，检查链接或网络' });
