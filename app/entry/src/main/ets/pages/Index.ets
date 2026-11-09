@@ -20,8 +20,13 @@ const BUILTIN_RULE_SRC: string = 'builtin://default';
  * 出口 IP 归属查询地址。已连接时代理生效、本应用没被 protect，
  * 这两个请求就是经节点出去的，返回的 IP 即「出口」而非本地宽带。
  */
-const EXIT_URL_PRIMARY: string = 'https://myip.ipip.net/';
+// 主源用 v4-only 的 geoip 接口：这个域名只返回 A 记录，探测连接被迫走 IPv4 进隧道。
+// 双栈网络下用双栈端点会被系统 Happy Eyeballs 选走 v6，而 v6 在鸿蒙这台设备上不进 tun（见 README 第 7 条），
+// 探测就会看到家里宽带的真实 v6 地址，误判成“泄漏”。
+const EXIT_URL_PRIMARY: string = 'https://api-ipv4.ip.sb/geoip';
 const EXIT_URL_BACKUP: string = 'https://api.ip.sb/geoip';
+// 保留给“v4-only 端点也挂了”时的最后兜底
+const EXIT_URL_IPIP: string = 'https://myip.ipip.net/';
 
 interface ExitGeo {
   ip?: string;
@@ -192,7 +197,7 @@ struct Index {
   private selected: number = -1;
   @State running: boolean = false;
   @State statusText: string = '未连接';
-  @State trafficText: string = '';
+  @State totalText: string = '';
   /** 当前出口 IP 归属，例如「出口 1.2.3.4 · 中国 江苏 无锡」；已连接时代理生效，请求走的就是出口 */
   @State exitInfo: string = '';
   @State exitBusy: boolean = false;
@@ -372,7 +377,7 @@ struct Index {
     FileStore.appendLog(this.filesDir, 'verify: no system vpn, force ui to disconnected');
     this.running = false;
     this.statusText = '未连接';
-    this.trafficText = '';
+    this.totalText = '';
     FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
   }
 
@@ -468,15 +473,14 @@ struct Index {
       if (this.statusText !== state.message && Date.now() > this.statusManualUntil) {
         this.statusText = state.message;
       }
-      // 瞬时速率大部分时间是 0，显示累计流量对用户更有意义
-      let traffic: string = '';
-      if (state.totalUp !== undefined && state.totalDown !== undefined) {
-        traffic = '↑' + Index.human(state.totalUp) + '  ↓' + Index.human(state.totalDown);
-      } else if (state.up !== undefined && state.down !== undefined) {
-        traffic = '↑' + Index.human(state.up) + '  ↓' + Index.human(state.down);
+      // 状态行只显示本次累计用量；实时速率对后台常驻的代理没实际意义，不再采集
+      let total: string = '';
+      if (state.totalUp !== undefined && state.totalDown !== undefined &&
+          (state.totalUp > 0 || state.totalDown > 0)) {
+        total = '累计 ↑' + Index.human(state.totalUp) + ' ↓' + Index.human(state.totalDown);
       }
-      if (this.trafficText !== traffic) {
-        this.trafficText = traffic;
+      if (this.totalText !== total) {
+        this.totalText = total;
       }
     } catch (err) {
     }
@@ -1045,7 +1049,22 @@ struct Index {
   }
 
   async probeExit(): Promise<ExitProbe> {
-    const text: string = await this.httpGet(EXIT_URL_PRIMARY, 5000);
+    // 主源（v4-only JSON）→ 备用 JSON → ipip HTML，依次降级
+    const primary: string = await this.httpGet(EXIT_URL_PRIMARY, 5000);
+    const geoProbe: ExitProbe | undefined = Index.geoJsonToProbe(primary);
+    if (geoProbe !== undefined) {
+      FileStore.appendLog(this.filesDir, 'geoip raw: ' +
+        primary.replace(/[\r\n]+/g, ' ').substring(0, 120));
+      return geoProbe;
+    }
+    const backup: string = await this.httpGet(EXIT_URL_BACKUP, 5000);
+    const backupProbe: ExitProbe | undefined = Index.geoJsonToProbe(backup);
+    if (backupProbe !== undefined) {
+      FileStore.appendLog(this.filesDir, 'geoip(backup) raw: ' +
+        backup.replace(/[\r\n]+/g, ' ').substring(0, 120));
+      return backupProbe;
+    }
+    const text: string = await this.httpGet(EXIT_URL_IPIP, 5000);
     if (text.length > 0) {
       const ipMatch = text.match(/IP[：:]\s*([0-9a-fA-F.:]+)/);
       const locMatch = text.match(/来自于[：:]\s*(.+)/);
@@ -1065,33 +1084,37 @@ struct Index {
         return { text: body, suspect: Index.looksLocal(loc2) };
       }
     }
-    // 备用源（返回 JSON，字段是英文）
-    const json: string = await this.httpGet(EXIT_URL_BACKUP, 5000);
-    if (json.length > 0) {
-      try {
-        const geo = JSON.parse(json) as ExitGeo;
-        const ip: string = geo.ip !== undefined ? geo.ip : '';
-        const code: string = geo.country_code !== undefined ? geo.country_code.toUpperCase() : '';
-        const parts: string[] = [];
-        if (geo.country !== undefined && geo.country.length > 0) {
-          parts.push(geoCn(geo.country));
-        }
-        if (geo.region !== undefined && geo.region.length > 0) {
-          parts.push(geoCn(geo.region));
-        }
-        if (geo.city !== undefined && geo.city.length > 0) {
-          parts.push(geoCn(geo.city));
-        }
-        if (ip.length > 0) {
-          const loc2: string = Index.shortLoc(parts.join(' '));
-          const body: string = '出口 ' + Index.shortIp(ip) + (loc2.length > 0 ? ' · ' + loc2 : '');
-          return { text: body, suspect: code === 'CN' };
-        }
-      } catch (err) {
-        return { text: '', suspect: false };
-      }
-    }
     return { text: '', suspect: false };
+  }
+
+  /** 解析 geoip JSON（api.ip.sb/geoip），失败返回 undefined */
+  private static geoJsonToProbe(raw: string): ExitProbe | undefined {
+    if (raw.length === 0) {
+      return undefined;
+    }
+    try {
+      const geo = JSON.parse(raw) as ExitGeo;
+      const ip: string = geo.ip !== undefined ? geo.ip : '';
+      if (ip.length === 0) {
+        return undefined;
+      }
+      const code: string = geo.country_code !== undefined ? geo.country_code.toUpperCase() : '';
+      const parts: string[] = [];
+      if (geo.country !== undefined && geo.country.length > 0) {
+        parts.push(geoCn(geo.country));
+      }
+      if (geo.region !== undefined && geo.region.length > 0) {
+        parts.push(geoCn(geo.region));
+      }
+      if (geo.city !== undefined && geo.city.length > 0) {
+        parts.push(geoCn(geo.city));
+      }
+      const loc2: string = Index.shortLoc(parts.join(' '));
+      const body: string = '出口 ' + Index.shortIp(ip) + (loc2.length > 0 ? ' · ' + loc2 : '');
+      return { text: body, suspect: code === 'CN' };
+    } catch (err) {
+      return undefined;
+    }
   }
 
   /**
@@ -1827,7 +1850,7 @@ struct Index {
     if (!stillThere) {
       this.running = false;
       this.statusText = '未连接';
-      this.trafficText = '';
+      this.totalText = '';
       this.exitSeq++;
       this.exitBusy = false;
       this.exitInfo = '';
@@ -2722,12 +2745,14 @@ struct Index {
         .backgroundColor('#8B3A3A')
 
         Column({ space: 8 }) {
-          Row({ space: 10 }) {
+          Row({ space: 8 }) {
             Text(this.statusText).fontSize(15).fontColor(this.running ? '#2E7D32' : '#5A5A5A')
             Blank()
-            Text(this.trafficText).fontSize(15).fontColor('#0A59F7')
-            if (this.testInfo.length > 0) {
-              Text(this.testInfo).fontSize(15).fontColor('#E84026')
+            // 中间空白处放本次累计：小灰字
+            if (this.totalText.length > 0) {
+              Text(this.totalText)
+                .fontSize(13)
+                .fontColor('#8A8F99')
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
@@ -2758,6 +2783,19 @@ struct Index {
                   this.refreshExit(1);
                 }
               })
+          }
+
+          // 测速进度单独一张卡：和流量计数挤一行会被省略号吃掉
+          if (this.testInfo.length > 0) {
+            Text(this.testInfo).fontSize(14).fontColor('#B25B3E')
+              .width('100%')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+              .borderRadius(10)
+              .backgroundColor('#FBF1EC')
+              .border({ width: 1, color: '#EDD6C9' })
+              .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
           }
         }
         .width('100%')

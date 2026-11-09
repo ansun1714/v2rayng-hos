@@ -399,6 +399,8 @@ export class ConfigBuilder {
     lines.push('mode: rule');
     // info 级别会把每条连接的目的地址写进日志，隐私上不可接受，只保留 warning 及以上
     lines.push('log-level: warning');
+    // IPv6 保持关闭：鸿蒙这台设备上 VpnConfig 的 v6 默认路由不会生效（真机实测），
+    // v6 一旦放出去就是绕过隧道直连、暴露真实地址。关掉它就只走 v4，全部流量进隧道。
     lines.push('ipv6: false');
     lines.push('unified-delay: true');
     lines.push('tcp-concurrent: true');

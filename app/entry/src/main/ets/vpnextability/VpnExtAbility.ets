@@ -99,15 +99,24 @@ export default class VpnExtAbility extends VpnExtensionAbility {
     const tunAddr: connection.NetAddress = { address: TUN_IP, family: 1, port: 0 };
     const zeroAddr: connection.NetAddress = { address: '0.0.0.0', family: 1, port: 0 };
 
+    // 实测结论（build29~33 四轮真机）：鸿蒙会把 v6 地址挂到 vpn-tun 上，
+    // 但 VpnConfig 里的 v6 默认路由（::/0 或 ::/1+8000::/1，接口名 tun0/vpn-tun 都试过）
+    // 一律不会被装进路由表，v6 数据报也不会投递到 tun fd。也就是说本版本无法接管 v6。
+    // 既然接不住，就把 v6 一并关掉（见 ConfigBuilder 的 ipv6: false），
+    // 让内核不给应用下发 AAAA，应用就不会主动产生绕过隧道的 v6 流量。
     const vpnConfig: vpnExtension.VpnConfig = {
-      addresses: [{ address: tunAddr, prefixLength: TUN_PREFIX }],
-      routes: [{
-        interface: 'tun0',
-        destination: { address: zeroAddr, prefixLength: 0 },
-        gateway: tunAddr,
-        hasGateway: false,
-        isDefaultRoute: true
-      }],
+      addresses: [
+        { address: tunAddr, prefixLength: TUN_PREFIX }
+      ],
+      routes: [
+        {
+          interface: 'tun0',
+          destination: { address: zeroAddr, prefixLength: 0 },
+          gateway: tunAddr,
+          hasGateway: false,
+          isDefaultRoute: true
+        }
+      ],
       dnsAddresses: [TUN_DNS],
       mtu: TUN_MTU,
       isIPv4Accepted: true,
