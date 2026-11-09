@@ -91,6 +91,11 @@ func ncore_set_log_cb(cb C.ncore_log_cb) {
 	sub := log.Subscribe()
 	go func() {
 		for ev := range sub {
+			// log.Subscribe 的订阅者不受 YAML 里 log-level 影响：INFO 里带每条连接的目的地址，
+			// 先在这里按 WARNING 过滤，作为 NAPI 侧过滤之外的第二道防线。
+			if ev.LogLevel < log.WARNING {
+				continue
+			}
 			cmsg := C.CString(ev.Payload)
 			if logCb != nil {
 				C.ncore_invoke_log(logCb, C.int(ev.LogLevel), cmsg)

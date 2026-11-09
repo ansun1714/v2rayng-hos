@@ -946,6 +946,13 @@ struct Index {
   }
 
   async httpGet(url: string, timeoutMs: number): Promise<string> {
+    // 兜底：所有拉取一律只走 https。订阅与规则链接走明文时 token 和节点凭据
+    // 会被同一网络里的中间人读走，响应还能被改写。出口探测两个地址本来就是 https，
+    // 测速走 NAPI 的 proxyDelay 不经过这里，因此不受影响。
+    if (!url.toLowerCase().startsWith('https://')) {
+      hilog.error(0x0001, 'V2rayNG-UI', 'httpGet refused: not https');
+      return '';
+    }
     const req = http.createHttp();
     try {
       const resp = await req.request(url, {
@@ -1159,6 +1166,11 @@ struct Index {
 
   /** 单个订阅分组更新：只刷新这个订阅的节点，其它分组不动。 */
   async refreshGroup(url: string): Promise<void> {
+    // 老版本允许 http 导入的订阅会落到这里；手动节点组没有刷新按钮，传进来的必然是订阅地址
+    if (!url.toLowerCase().startsWith('https://')) {
+      this.toast.showToast({ message: '该订阅是明文 http，已拒绝更新；请改用 https 地址重新导入' });
+      return;
+    }
     this.statusText = '正在更新订阅…';
     const body: string = await this.httpGet(url, 15000);
     if (body.trim().length === 0) {

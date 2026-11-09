@@ -45,18 +45,23 @@ static FnSetProtectCb g_setProtectCb = nullptr;
 static FnSetLogCb g_setLogCb = nullptr;
 
 // ---- 内核日志桥：Go 侧 log.Subscribe 的回调落到 hilog（NG-CORE）----
-// 只放 error/warn：info 级别会逐条记录连接的目的地址（域名/IP），
-// 落进系统日志等于把访问记录交出去，所以 info/debug 一律丢弃。
+// level 沿用 mihomo 原生枚举：0 DEBUG / 1 INFO / 2 WARNING / 3 ERROR / 4 SILENT。
+// 内核把所有等级无条件推给订阅者（配置里的 log-level 只管控制台输出），
+// INFO 会逐条记录连接的目的地址（域名/IP），落进系统日志等于交出访问记录。
+// 所以只放行 WARNING 及以上，并丢掉带「来源 --> 目的」的拨号失败行。
 static void GoLog(int level, const char *msg) {
     if (msg == nullptr) {
         return;
     }
     LogLevel lv;
-    if (level <= 1) {
+    if (level == 3) {
         lv = LOG_ERROR;
     } else if (level == 2) {
         lv = LOG_WARN;
     } else {
+        return;
+    }
+    if (strstr(msg, " --> ") != nullptr) {
         return;
     }
     OH_LOG_Print(LOG_APP, lv, kDomain, "NG-CORE", "%{public}s", msg);
