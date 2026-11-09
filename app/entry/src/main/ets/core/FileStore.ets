@@ -47,13 +47,18 @@ export class FileStore {
     }
   }
 
+  /** 运行日志路径。日志只落本机沙盒，界面可以一键清除。 */
+  static logPath(filesDir: string): string {
+    return FileStore.ensureDir(filesDir) + '/vpn.log';
+  }
+
   /**
    * 追加一行运行日志（vpn.log）。界面进程与扩展进程都会写同一个文件，
    * 这里用「读旧 + 截断 + 重写」的方式，并保留最近 240 行，避免越写越大。
    */
   static appendLog(filesDir: string, line: string): void {
     try {
-      const path: string = FileStore.ensureDir(filesDir) + '/vpn.log';
+      const path: string = FileStore.logPath(filesDir);
       const old: string = FileStore.readText(path);
       let lines: string[] = old.length > 0 ? old.split('\n') : [];
       const now: Date = new Date();

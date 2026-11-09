@@ -1460,6 +1460,12 @@ struct Index {
     return String(value) + ' ms';
   }
 
+  /** 清除本机运行日志（vpn.log）。系统日志 hilog 归系统所有，应用无权清理。 */
+  clearRunLog(): void {
+    FileStore.removeFile(FileStore.logPath(this.filesDir));
+    this.toast.showToast({ message: '运行日志已清除' });
+  }
+
   // ---------- 分流规则 ----------
 
   openRules(): void {
@@ -2291,6 +2297,20 @@ struct Index {
           .onClick(() => {
             this.openRules();
           })
+
+        Button('清除运行日志')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.clearRunLog();
+          })
+
+        Text('运行日志只存在本机应用目录，记录连接状态与出口探测结果，保留最近 240 行。')
+          .fontSize(13)
+          .fontColor('#5A5A5A')
 
         Blank()
       }

@@ -247,11 +247,28 @@ jobs:
             echo "- sha256: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
           done
 
+      # 除了 HAP，把仓库里预编译的两个 .so 与 geo 数据也列进清单：
+      # 别人用 tools\build-core.ps1 / build-napi.ps1 重编后，可以逐行对照源码产物与仓库产物。
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          ( cd out && sha256sum entry-default-unsigned.hap ) > out/SHA256SUMS.txt
+          sha256sum \
+            app/entry/libs/arm64-v8a/libngcore.so \
+            app/entry/libs/arm64-v8a/libngnapi.so \
+            app/entry/src/main/resources/rawfile/geoip.dat \
+            app/entry/src/main/resources/rawfile/geosite.dat \
+            >> out/SHA256SUMS.txt
+          echo "== SHA256SUMS.txt =="
+          cat out/SHA256SUMS.txt
+
       - name: Upload unsigned HAP
         uses: actions/upload-artifact@v4
         with:
           name: v2rayng-ohos-unsigned-hap-api${{ env.SDK_API }}
-          path: out/*.hap
+          path: |
+            out/*.hap
+            out/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -272,7 +289,7 @@ jobs:
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
           auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
 
-          body="$(printf '由 GitHub Actions 在云端自动构建，**未签名**，需要自己签一次名再侧载。\n\n| 项 | 值 |\n| --- | --- |\n| 文件 | `entry-default-unsigned.hap` |\n| 大小 | %s 字节 |\n| SHA256 | `%s` |\n| 构建 | [run #%s](%s/%s/actions/runs/%s) · `%s` |\n| 构建时间 | %s |\n\n包里含 mihomo 内核 `libngcore.so`、NAPI 桥 `libngnapi.so`、`libc++_shared.so`，以及分流数据 `geoip.dat` / `geosite.dat`。\n\n签名与装机步骤见 README「签名与装机」。CI 自己依赖的 hvigor tarball 在 prerelease `hvigor-5.19.8`，不是应用成品。' "$size" "$sha" "$GITHUB_RUN_NUMBER" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$short_sha" "$built_at")"
+          body="$(printf '由 GitHub Actions 在云端自动构建，**未签名**，需要自己签一次名再侧载。\n\n| 项 | 值 |\n| --- | --- |\n| 文件 | `entry-default-unsigned.hap` |\n| 大小 | %s 字节 |\n| SHA256 | `%s` |\n| 构建 | [run #%s](%s/%s/actions/runs/%s) · `%s` |\n| 构建时间 | %s |\n\n包里含 mihomo 内核 `libngcore.so`、NAPI 桥 `libngnapi.so`、`libc++_shared.so`，以及分流数据 `geoip.dat` / `geosite.dat`。\n\n同目录的 `SHA256SUMS.txt` 一并列出 HAP、两个预编译 `.so` 与 geo 数据的 sha256；要核对二进制是不是这些源码编出来的，按 README「二进制与源码的对应」用 `tools/build-core.ps1`、`tools/build-napi.ps1` 重编后逐行比对。\n\n签名与装机步骤见 README「签名与装机」。CI 自己依赖的 hvigor tarball 在 prerelease `hvigor-5.19.8`，不是应用成品。' "$size" "$sha" "$GITHUB_RUN_NUMBER" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$short_sha" "$built_at")"
 
           rel_id="$(curl -sS "${auth[@]}" "$api/releases/tags/hap-latest" | jq -r '.id // empty')"
           if [ -z "$rel_id" ]; then
@@ -283,7 +300,7 @@ jobs:
             echo "updating release hap-latest (id=$rel_id)"
             payload="$(jq -n --arg b "$body" '{body:$b}')"
             curl -sS "${auth[@]}" -X PATCH -H "Content-Type: application/json" -d "$payload" "$api/releases/$rel_id" > /dev/null
-            for aid in $(curl -sS "${auth[@]}" "$api/releases/$rel_id/assets" | jq -r '.[] | select(.name=="entry-default-unsigned.hap") | .id'); do
+            for aid in $(curl -sS "${auth[@]}" "$api/releases/$rel_id/assets" | jq -r '.[] | select(.name=="entry-default-unsigned.hap" or .name=="SHA256SUMS.txt") | .id'); do
               echo "removing old asset $aid"
               curl -sS "${auth[@]}" -X DELETE "$api/releases/assets/$aid" > /dev/null
             done
@@ -293,4 +310,10 @@ jobs:
                 --data-binary "@$hap" \
                 "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${rel_id}/assets?name=entry-default-unsigned.hap")"
           echo "$up" | jq -r '"published: id=\(.id) size=\(.size) state=\(.state) url=\(.browser_download_url)"'
+
+          up2="$(curl -sS "${auth[@]}" -H "Content-Type: text/plain" \
+                --data-binary "@out/SHA256SUMS.txt" \
+                "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${rel_id}/assets?name=SHA256SUMS.txt")"
+          echo "$up2" | jq -r '"published: id=\(.id) size=\(.size) state=\(.state) url=\(.browser_download_url)"'
+          echo "- checksums: \`SHA256SUMS.txt\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/hap-latest" >> "$GITHUB_STEP_SUMMARY"

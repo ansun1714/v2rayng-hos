@@ -179,19 +179,37 @@ Copy-Item entry/src/main/resources/rawfile/nodes.txt.example entry/src/main/reso
 **4. 编译内核库（仓库已附带预编译产物，可跳过）**
 
 `entry/libs/arm64-v8a/libngcore.so` 是 mihomo 交叉编译出来的 `c-shared` 库，运行时 dlopen 加载。
-仓库里已经带了一份；要自己重编，用 Go 配合 NDK clang 交叉编译：
+仓库里已经带了一份；要自己重编（也是核对二进制来源的推荐做法），用 OpenHarmony Go 工具链配合 NDK clang：
 
 ```powershell
-# 关键点：GOOS=linux、GOARCH=arm64、CGO_ENABLED=1，CC/CXX 指向 NDK 的 clang
-# 并在 core-native 目录执行 c-shared 构建，产物复制到 app/entry/libs/arm64-v8a/libngcore.so
+pwsh -NoProfile -File tools\build-core.ps1 `
+  -Sdk "你的 SDK 根目录" -Api "15" -GoRoot "你的 ohos-go 工具链根目录"
 ```
 
-NAPI 库（`libngnapi.so`）也可以用脚本重编：
+脚本内部做的事：`GOOS=openharmony`、`GOARCH=arm64`、`CGO_ENABLED=1`、`CC` 指向 NDK 的 clang，
+在 `core-native` 目录执行 `go build -buildmode=c-shared -tags with_gvisor -trimpath -ldflags="-s -w"`，
+完事打印产物的 `size` 与 `sha256`，并检查二进制里有没有残留本机路径（`-trimpath` 失效会告警）。
+用的是 [OpenHarmony 的 Go fork](https://gitee.com/openharmony/third_party_go)，官方 Go 包不支持 `GOOS=openharmony`。
+
+NAPI 库（`libngnapi.so`）同样可以自己重编：
 
 ```powershell
-$env:OHOS_SDK = "你的 SDK 根目录"
-pwsh .\tools\build-napi.ps1
+pwsh -NoProfile -File tools\build-napi.ps1 -Sdk "你的 SDK 根目录" -Api "15"
 ```
+
+**二进制与源码的对应**
+
+两个 `.so` 是仓库里的预编译产物，CI 不重建（重建内核要额外装 Go 与 NDK）。为了能核对"手上的二进制是不是这些源码编出来的"：
+
+- 每个 Release（`hap-latest`）都附 `SHA256SUMS.txt`，列出 HAP、`libngcore.so`、`libngnapi.so`、`geoip.dat`、`geosite.dat` 的 sha256
+- 按上面两条命令重编后，把打印出来的 sha256 与清单里对应行对照
+- 仓库里这两份产物已用上述脚本重编验证过，**逐字节一致**：
+  `libngcore.so` = 63,941,544 字节 `75c77b70b2fafb4c1460440a4e44670c2a6a23bbc2167305e4a5f65bdd963d4a`，
+  `libngnapi.so` = 40,072 字节 `4c825269605ab31701ab960de88487423e7288171453c14e3ee4252331ead648`
+- OpenHarmony Go fork 与 NDK 的版本会影响产物字节，**逐字节相同的哈希只在工具链版本相同时也成立**；
+  工具链不同时应比对依赖是否一致、产物是否残留本机路径，而不是强求同一个哈希
+- `libngnapi.so` 只有四个依赖（`libace_napi.z.so` / `libhilog_ndk.z.so` / `libc++_shared.so` / `libc.so`），
+  `libngcore.so` 只依赖 `libc.so`；多出别的依赖说明链接被改过
 
 **5. 构建 HAP**
 
@@ -217,7 +235,10 @@ hdc install -r entry-default-signed.hap
 
 ## 更新记录
 
-- **本轮**：节点列表改为 `LazyForEach` 懒加载（修掉「测速完不排序」「点一下卡十几秒」）；点选节点只重绘两行、
+- **本轮**：订阅组头图标化单行（改名笔 / 刷新 / 测速闪电三个圆钮）、订阅组卡片化与状态行双阴影；
+  Release 附 `SHA256SUMS.txt`，两个预编译 `.so` 已用 `tools/build-core.ps1` / `build-napi.ps1` 实测可逐字节复现；
+  抽屉里加「清除运行日志」；内核日志只放行 WARNING/ERROR 并丢弃带目的地址的拨号行
+- 前一轮：节点列表改为 `LazyForEach` 懒加载（修掉「测速完不排序」「点一下卡十几秒」）；点选节点只重绘两行、
   蓝色对勾即时落在点击行；已连接时点选节点自动切换（0.8 秒防抖）；连接/断开与切换全程有状态文案，按钮在过程中置灰
 - 早期：VPN 状态以系统实际存在为准（修「图标消失但界面显示已连接」）、断开/重连改成轮询等通道消失、
   左滑露出编辑/删除、分流规则面板与社区 payload 兼容、全站字号放大
@@ -230,6 +251,15 @@ hdc install -r entry-default-signed.hap
 4. 文件导入的「选文件 → 读取 → 覆盖」链路在自动化环境里没跑通端到端（系统文件选择器不接收注入），需人工点一次确认
 5. 不自动挑选「最优节点」（有意为之，节点由你自己选）；已连接时点选节点才会自动切过去，只是想浏览就先停掉代理
 6. 只有一个 `arm64-v8a` 的预编译内核库，其它 ABI 需自行编译
+7. **IPv6 不接管**：鸿蒙 `VpnConfig` 这里设的是 `isIPv6Accepted: false`，tun 只配了 IPv4 默认路由，
+   内核也关着 IPv6。设备若拿到 IPv6 地址，这部分流量会走物理链路，不经过代理隧道（IPv4 流量不受影响）。
+   要接管 IPv6 得同时打开 `isIPv6Accepted`、补 `::/0` 路由与 tun 的 v6 地址、并让内核处理 v6，
+   需要的节点也必须支持 v6，因此没有默认开启
+8. 没有 kill switch：鸿蒙 `VpnConfig.isBlocking` 指的是 tun fd 的阻塞读写模式，不是 Android 那种「断开时拦流量」；
+   API 里也没有 always-on / lockdown 字段。扩展异常退出时，系统会回到直连
+9. 节点凭据（密码、原始分享链接、订阅 URL）以明文 JSON 存在应用沙盒的 `profiles.json`；
+   沙盒其他应用读不到，但设备被 root、被备份或被调试读取时会暴露。日志（`vpn.log`）保留最近 240 行，
+   只记连接状态与出口探测结果，不记订阅 URL 与节点凭据，界面里可一键清除
 
 ## 免责声明
 
