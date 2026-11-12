@@ -1,6 +1,7 @@
-import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { common, AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { KeepAliveManager } from '../core/KeepAliveManager';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'V2rayNG';
@@ -8,6 +9,9 @@ const TAG: string = 'V2rayNG';
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'EntryAbility onCreate');
+    // 注入应用级 UIAbilityContext：长时任务必须由它申请，且 userStopped 的
+    // 持久化要在页面出现、用户点击之前就恢复完成。
+    KeepAliveManager.getInstance().init(this.context as common.UIAbilityContext);
     // 支持 aa start --ps importUri "<链接>" 一次性导入（便于自动化与批量导入）
     const extra: Object | undefined = want.parameters?.importUri;
     if (extra !== undefined && extra !== null) {
@@ -36,9 +40,23 @@ export default class EntryAbility extends UIAbility {
   onWindowStageDestroy(): void {
   }
 
+  /** 回到前台：打状态快照并立即复核一次长时任务（force）。 */
   onForeground(): void {
+    const mgr: KeepAliveManager = KeepAliveManager.getInstance();
+    mgr.snapshot('onForeground');
+    mgr.ensureRunning(this.context as common.UIAbilityContext, true)
+      .catch((err: Error) => {
+        hilog.error(DOMAIN, TAG, 'ensure onForeground failed: %{public}s', err.message);
+      });
   }
 
+  /** 切后台：同样复核一次；无业务或用户已停止时管理器会自行跳过。 */
   onBackground(): void {
+    const mgr: KeepAliveManager = KeepAliveManager.getInstance();
+    mgr.snapshot('onBackground');
+    mgr.ensureRunning(this.context as common.UIAbilityContext, false)
+      .catch((err: Error) => {
+        hilog.error(DOMAIN, TAG, 'ensure onBackground failed: %{public}s', err.message);
+      });
   }
 }

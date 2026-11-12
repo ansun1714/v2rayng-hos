@@ -6,6 +6,11 @@ import { util } from '@kit.ArkTS';
 import { resourceManager } from '@kit.LocalizationKit';
 import { Profile, RuleItem } from './Model';
 
+/** state.json 中由 UI 进程维护的用户意图标记（旧版本文件里没有，按 false 处理）。 */
+interface StateFlag {
+  userStopped?: boolean;
+}
+
 export class FileStore {
   static dir(filesDir: string): string {
     return filesDir + '/v2rayng';
@@ -84,6 +89,54 @@ export class FileStore {
 
   static statePath(filesDir: string): string {
     return FileStore.ensureDir(filesDir) + '/state.json';
+  }
+
+  /**
+   * 读用户「主动停止代理」标记。字段缺失 / 文件不存在 / 解析失败一律按 false，
+   * 兼容旧版本 state.json（只有 running/message/up/down 等字段）。
+   */
+  static readUserStopped(filesDir: string): boolean {
+    const text: string = FileStore.readText(FileStore.statePath(filesDir));
+    if (text.length === 0) {
+      return false;
+    }
+    try {
+      const state: StateFlag = JSON.parse(text) as StateFlag;
+      return state.userStopped === true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /** 供各写状态处拼接的 userStopped 片段，避免覆盖写把它抹掉。 */
+  static userStoppedField(filesDir: string): string {
+    return ',"userStopped":' + String(FileStore.readUserStopped(filesDir));
+  }
+
+  /**
+   * 读-改-写更新 state.json 的 userStopped，保留其余字段。
+   * 只在用户点击连接/断开时低频调用，不进任何高频定时器；
+   * 用字符串替换而非反序列化重建，避免丢掉内核写入的统计字段。
+   */
+  static writeUserStopped(filesDir: string, value: boolean): void {
+    const path: string = FileStore.statePath(filesDir);
+    let text: string = FileStore.readText(path);
+    if (text.length === 0) {
+      text = '{"running":false,"message":"未连接"}';
+    }
+    let cleaned: string = text;
+    const trueKey: string = ',"userStopped":true';
+    const falseKey: string = ',"userStopped":false';
+    if (cleaned.indexOf(trueKey) >= 0) {
+      cleaned = cleaned.replace(trueKey, '');
+    } else if (cleaned.indexOf(falseKey) >= 0) {
+      cleaned = cleaned.replace(falseKey, '');
+    }
+    let body: string = cleaned.trim();
+    if (body.endsWith('}')) {
+      body = body.substring(0, body.length - 1);
+      FileStore.writeText(path, body + ',"userStopped":' + String(value) + '}');
+    }
   }
 
   /** 测速请求：界面进程写，VPN 扩展进程（内核所在进程）读。 */

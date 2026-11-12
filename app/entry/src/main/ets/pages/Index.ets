@@ -9,10 +9,17 @@ import { ProxyLink } from '../core/ProxyLink';
 import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem } from '../core/Model';
 import { ConfigBuilder } from '../core/ConfigBuilder';
 import { FileStore } from '../core/FileStore';
+import { KeepAliveManager } from '../core/KeepAliveManager';
 
 const BUNDLE_NAME: string = 'com.maoxu.v2rayng';
 const EXT_ABILITY: string = 'VpnExtAbility';
 const TEST_URL: string = 'http://www.gstatic.com/generate_204';
+/** 自动恢复：连续 3 次（约 9s）确认系统 VPN 缺失，规避建连瞬间误判 */
+const RECOVER_CONFIRM: number = 3;
+/** 自动恢复退避：5→10→20→60s 封顶 */
+const RECOVER_DELAYS: number[] = [5000, 10000, 20000, 60000];
+/** 自动恢复尝试上限，超过后停止重连，避免无限循环 */
+const RECOVER_MAX_ATTEMPTS: number = 8;
 /** 规则订阅地址的默认值：内置推荐规则集（点「网址更新」即还原默认 6 条）。 */
 const BUILTIN_RULE_SRC: string = 'builtin://default';
 
@@ -27,6 +34,8 @@ const EXIT_URL_PRIMARY: string = 'https://api-ipv4.ip.sb/geoip';
 const EXIT_URL_BACKUP: string = 'https://api.ip.sb/geoip';
 // 保留给“v4-only 端点也挂了”时的最后兜底
 const EXIT_URL_IPIP: string = 'https://myip.ipip.net/';
+// 交叉校验源：另一家 v4-only 端点，只用来核对主源报的 IP 是否可信（不参与显示）
+const EXIT_URL_CROSS: string = 'https://ipv4.icanhazip.com/';
 
 interface ExitGeo {
   ip?: string;
@@ -40,6 +49,8 @@ interface ExitGeo {
 interface ExitProbe {
   text: string;
   suspect: boolean;
+  /** 主源报出来的源 IP，用于交叉校验 */
+  ip: string;
 }
 
 /** 备用源（api.ip.sb）返回英文，常见国家和城市映射成中文，保证「国家」一定看得懂 */
@@ -276,6 +287,16 @@ struct Index {
   private switchTimer: number = -1;
   /** 手动推进度提示的保护区：这段时间内不让 state.json 的旧文案把它盖掉 */
   private statusManualUntil: number = 0;
+  /** 自动恢复：系统 VPN 连续缺失计数 */
+  private lostCount: number = 0;
+  /** 自动恢复互斥，避免同一时刻多路重连 */
+  private recovering: boolean = false;
+  /** 自动恢复已尝试次数（退避用） */
+  private recoverAttempt: number = 0;
+  /** 自动恢复退避定时器 */
+  private recoverTimer: number = -1;
+  /** 后台保活不可用提示（长时任务连续申请失败时显示，不再静默） */
+  @State keepAliveWarn: string = '';
 
   /** 显示一条自己控制的进度文案，几秒内不被轮询覆盖 */
   private setStatus(text: string): void {
@@ -287,10 +308,12 @@ struct Index {
   aboutToAppear(): void {
     const context = getContext(this) as common.UIAbilityContext;
     this.filesDir = context.filesDir;
+    // 注入应用级 context，确保 userStopped 持久化在用户点击前已恢复
+    KeepAliveManager.getInstance().init(context);
     // 只在状态文件不存在时初始化；已有状态交给 readState + verifyRunning 判断，
     // 否则每次重新进入页面都会把上一轮的真实状态（可能是运行中）覆盖成「未连接」。
     if (FileStore.readText(FileStore.statePath(this.filesDir)).length === 0) {
-      FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
+      FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"' + FileStore.userStoppedField(this.filesDir) + '}');
     }
     this.reload();
     this.loadGroupNames();
@@ -343,6 +366,11 @@ struct Index {
       clearInterval(this.watchTimer);
       this.watchTimer = -1;
     }
+    if (this.recoverTimer >= 0) {
+      clearTimeout(this.recoverTimer);
+      this.recoverTimer = -1;
+    }
+    this.recovering = false;
   }
 
   /** 系统里当前是否真的有 VPN 通道（权威判断，优于状态文件里的 running 字段）。 */
@@ -363,22 +391,90 @@ struct Index {
   }
 
   /**
-   * 校准运行状态：扩展被系统杀掉（VPN 图标消失）时，state.json 往往还停在 running=true，
-   * 于是按钮一直显示「停止代理」、点也停不掉。这里以系统 VPN 是否存在为准把状态纠正回来。
+   * 校准运行状态：扩展被系统杀掉（VPN 图标消失）时，state.json 往往还停在 running=true。
+   * 以系统 VPN 是否存在为准，并区分「用户主动断开」与「疑似被系统回收」：
+   * - 用户主动断开：只把界面/状态文件纠正为未连接，绝不自动重连或申请保活；
+   * - 疑似被回收：连续 3 次确认（约 9s，规避建连瞬间 getAllNets 未出现
+   *   BEARER_VPN 导致的 13:09 型 2s 误判）后，按退避自动恢复。
    */
   async verifyRunning(): Promise<void> {
     if (!this.running) {
+      this.lostCount = 0;
       return;
     }
     const alive: boolean = await this.hasSystemVpn();
     if (alive) {
+      this.lostCount = 0;
+      this.recoverAttempt = 0;
       return;
     }
+    const mgr: KeepAliveManager = KeepAliveManager.getInstance();
+    if (mgr.isUserStopped()) {
+      FileStore.appendLog(this.filesDir, 'verify: no system vpn, force ui to disconnected');
+      this.applyDisconnected();
+      return;
+    }
+    this.lostCount++;
+    if (this.lostCount < RECOVER_CONFIRM) {
+      return;
+    }
+    this.lostCount = 0;
     FileStore.appendLog(this.filesDir, 'verify: no system vpn, force ui to disconnected');
+    this.applyDisconnected();
+    // 检出疑似系统回收：置冷却（不立即重申请长时任务），再排自动恢复
+    mgr.noteTaskCancelled();
+    this.scheduleRecover();
+  }
+
+  /** 把界面与状态文件纠正为未连接（不改 userStopped，不释放保活）。 */
+  private applyDisconnected(): void {
     this.running = false;
     this.statusText = '未连接';
     this.totalText = '';
-    FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
+    FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"' + FileStore.userStoppedField(this.filesDir) + '}');
+  }
+
+  /**
+   * 自动恢复调度：去重（recovering + 单定时器）、5→10→20→60s 封顶退避、
+   * 尝试上限，并把冷却剩余并入延迟以规避「系统取消后立即再次申请」红线。
+   * 复用现有 connect() 启动 vpnExtension 的入口（fromRecover=true 不改 userStopped）。
+   */
+  private scheduleRecover(): void {
+    const mgr: KeepAliveManager = KeepAliveManager.getInstance();
+    if (this.recovering || this.recoverTimer >= 0) {
+      return;
+    }
+    if (mgr.isUserStopped()) {
+      return;
+    }
+    if (this.recoverAttempt >= RECOVER_MAX_ATTEMPTS) {
+      FileStore.appendLog(this.filesDir, 'recover: give up after max attempts');
+      return;
+    }
+    const idx: number = Math.min(this.recoverAttempt, RECOVER_DELAYS.length - 1);
+    const baseDelay: number = RECOVER_DELAYS[idx];
+    const delayMs: number = Math.max(baseDelay, mgr.cooldownRemaining());
+    this.recoverAttempt++;
+    this.recovering = true;
+    FileStore.appendLog(this.filesDir, 'verify: vpn lost, auto recovering attempt=' +
+      String(this.recoverAttempt) + ' delay=' + String(delayMs));
+    this.recoverTimer = setTimeout(() => {
+      this.recoverTimer = -1;
+      this.recovering = false;
+      if (!mgr.canAutoRecover()) {
+        return;
+      }
+      this.connect(true).catch((err: Error) => {
+        FileStore.appendLog(this.filesDir, 'recover: connect failed ' + err.message);
+      });
+      // 8s 后复查：扩展拉起失败（running 仍为 false）就按递增退避再排一轮
+      this.recoverTimer = setTimeout(() => {
+        this.recoverTimer = -1;
+        if (!this.running && !mgr.isUserStopped()) {
+          this.scheduleRecover();
+        }
+      }, 8000);
+    }, delayMs);
   }
 
   // ---------- 数据 ----------
@@ -462,13 +558,33 @@ struct Index {
         if (this.running) {
           // 刚连上，隧道还没稳，稍等一下再测出口
           this.scheduleExitRefresh(2000, 1);
+          // 连上立即申请一次长时任务（force）：不再只依赖边沿触发。
+          // 真机 14:10/14:14 重连时边沿丢失导致 69 分钟后台无保活，
+          // 这是「漏申请」根因的第一道修复。
+          this.requestKeepAlive();
         } else {
           this.exitSeq++;
           this.exitBusy = false;
           if (this.exitInfo.length > 0) {
             this.exitInfo = '';
           }
+          // 仅用户主动停止才释放长时任务；系统回收 / UI 校正时保留保活，
+          // 避免把「被回收」误当成「用户停止」而丢掉后台保护。
+          if (KeepAliveManager.getInstance().isUserStopped()) {
+            this.releaseKeepAlive();
+          }
         }
+      }
+      // 状态驱动低频复核：只要 VPN 仍在运行，就周期性确认长时任务还在
+      // （管理器内部 ≥30s 节流 + 冷却），不依赖任何边沿或组件实例布尔量。
+      // 这是「漏申请」根因的主修复，组件重建、页面切后台都不会再漏。
+      if (state.running && !KeepAliveManager.getInstance().isUserStopped()) {
+        this.ensureKeepAlive();
+      }
+      // 保活连续失败时给出可见提示，不再静默地显示「已连接」
+      const warn: string = KeepAliveManager.getInstance().warningText(state.running);
+      if (this.keepAliveWarn !== warn) {
+        this.keepAliveWarn = warn;
       }
       if (this.statusText !== state.message && Date.now() > this.statusManualUntil) {
         this.statusText = state.message;
@@ -969,6 +1085,7 @@ struct Index {
       if (resp.responseCode !== 200) {
         // 不打印 url：订阅链接里带 token，落到系统日志等于把凭据写进日志
         hilog.error(0x0001, 'V2rayNG-UI', 'httpGet code=%{public}d', resp.responseCode);
+        FileStore.appendLog(this.filesDir, 'httpGet non-200: ' + String(resp.responseCode));
         return '';
       }
       // 某些版本 result 会是 ArrayBuffer，直接 String() 只会得到 "[object ArrayBuffer]"
@@ -982,6 +1099,8 @@ struct Index {
       const be = err as BusinessError;
       hilog.error(0x0001, 'V2rayNG-UI', 'httpGet fail code=%{public}d msg=%{public}s',
         be.code !== undefined ? be.code : -1, String(be.message));
+      FileStore.appendLog(this.filesDir, 'httpGet err: code=' +
+        String(be.code !== undefined ? be.code : -1) + ' msg=' + String(be.message));
       return '';
     } finally {
       req.destroy();
@@ -1023,68 +1142,83 @@ struct Index {
       return;
     }
     if (text.length > 0 && !suspect) {
+      // 非大陆归属 = 真出口，直接显示
       this.exitBusy = false;
       if (this.exitInfo !== text) {
         this.exitInfo = text;
       }
       return;
     }
-    // 空结果（隧道还没通）或归属是中国大陆（走了直连）：这一枪不算数，等一会儿重测，
-    // 不把错误结果写到界面上，避免「先显示国内 IP、过一会才变」。
-    if (this.running && attempt < 4) {
-      this.scheduleExitRefresh(text.length === 0 ? 2500 : 1500, attempt + 1);
+    // 空结果 = 隧道还没通；归属中国大陆 = 这一枪走了家宽直连（VPN 刚被回收那几秒会这样）。
+    // 两种都不能显示成出口。实测冷启动时节点的中转链路要 20 秒以上才通，前几枪全是超时，
+    // 所以前 6 枪按 2.5~4 秒紧凑重试，之后放慢到 8 秒继续重试（期间界面保持「正在测」）。
+    if (this.running) {
+      const fast: boolean = attempt < 6;
+      const delayMs: number = fast ? (text.length === 0 ? 2500 : 4000) : 8000;
+      this.scheduleExitRefresh(delayMs, attempt + 1);
       return;
     }
     this.exitBusy = false;
-    if (text.length > 0) {
-      // 连测多枪都是大陆归属：用户可能真选了国内节点，照样显示
-      if (this.exitInfo !== text) {
-        this.exitInfo = text;
-      }
-      return;
-    }
-    if (!this.running && this.exitInfo.length > 0) {
+    if (this.exitInfo.length > 0) {
       this.exitInfo = '';
     }
   }
 
+  /**
+   * 长时任务保活统一委托给应用级单例 KeepAliveManager。
+   * 旧实现把 bgRunning 放在组件实例里，只在 readState 的 false→true 边沿申请，
+   * 真机 14:10/14:14 重连时该边沿丢失，整个后台期没有长时任务，扩展被回收。
+   * 现在由单例以状态驱动方式统一申请、复核与释放。
+   */
+  private requestKeepAlive(): void {
+    const uiContext = getContext(this) as common.UIAbilityContext;
+    KeepAliveManager.getInstance().ensureRunning(uiContext, true)
+      .catch((err: Error) => {
+        FileStore.appendLog(this.filesDir, 'requestKeepAlive failed: ' + err.message);
+      });
+  }
+
+  /** 低频复核：管理器内部 ≥30s 节流 + 冷却，force=false。 */
+  private ensureKeepAlive(): void {
+    const uiContext = getContext(this) as common.UIAbilityContext;
+    KeepAliveManager.getInstance().ensureRunning(uiContext, false)
+      .catch((err: Error) => {
+        FileStore.appendLog(this.filesDir, 'ensureKeepAlive failed: ' + err.message);
+      });
+  }
+
+  private releaseKeepAlive(): void {
+    const uiContext = getContext(this) as common.UIAbilityContext;
+    KeepAliveManager.getInstance().stop(uiContext)
+      .catch((err: Error) => {
+        FileStore.appendLog(this.filesDir, 'releaseKeepAlive failed: ' + err.message);
+      });
+  }
+
   async probeExit(): Promise<ExitProbe> {
-    // 主源（v4-only JSON）→ 备用 JSON → ipip HTML，依次降级
-    const primary: string = await this.httpGet(EXIT_URL_PRIMARY, 5000);
+    // 只打 v4-only 主源。启动初期隧道/DNS 未就绪时主源会失败，此时返回空，
+    // 由上层 refreshExit 在 2.5 秒后自动重试——不要立刻 fallback 到双栈端点，
+    // 那时候 mihomo 规则还没完全生效，fallback 请求可能走偏，返回错误的出口 IP
+    // （实测：启动 5 秒内 fallback 到 api.ip.sb，拿到一个不属于选中节点的 Azure IP）。
+    const primary: string = await this.httpGet(EXIT_URL_PRIMARY, 6000);
     const geoProbe: ExitProbe | undefined = Index.geoJsonToProbe(primary);
     if (geoProbe !== undefined) {
       FileStore.appendLog(this.filesDir, 'geoip raw: ' +
         primary.replace(/[\r\n]+/g, ' ').substring(0, 120));
+      // 交叉校验：主源报了这个 IP，再问另一家 v4-only 端点看到的源地址。
+      // 注意：有些机场节点是多后端负载均衡（实测同一条节点，不同出口 IP：
+      // ip.sb 看到 Azure SG，另一家看到 First Server SG，都是真出口），
+      // 两家不一致并不代表探测走偏——所以只记日志留证，不拦截显示。
+      const crossRaw: string = await this.httpGet(EXIT_URL_CROSS, 6000);
+      const cross: string = crossRaw.trim();
+      FileStore.appendLog(this.filesDir, 'cross check: primary=' + geoProbe.ip +
+        ' cross=' + (cross.length > 0 ? cross : '(empty)') +
+        (cross.length > 0 && cross !== geoProbe.ip ? ' (multi-backend node, exit varies)' : ''));
       return geoProbe;
     }
-    const backup: string = await this.httpGet(EXIT_URL_BACKUP, 5000);
-    const backupProbe: ExitProbe | undefined = Index.geoJsonToProbe(backup);
-    if (backupProbe !== undefined) {
-      FileStore.appendLog(this.filesDir, 'geoip(backup) raw: ' +
-        backup.replace(/[\r\n]+/g, ' ').substring(0, 120));
-      return backupProbe;
-    }
-    const text: string = await this.httpGet(EXIT_URL_IPIP, 5000);
-    if (text.length > 0) {
-      const ipMatch = text.match(/IP[：:]\s*([0-9a-fA-F.:]+)/);
-      const locMatch = text.match(/来自于[：:]\s*(.+)/);
-      let ip: string = '';
-      if (ipMatch !== null && ipMatch.length > 1) {
-        ip = ipMatch[1].trim();
-      }
-      let loc: string = '';
-      if (locMatch !== null && locMatch.length > 1) {
-        loc = locMatch[1].replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
-      }
-      if (ip.length > 0) {
-        const loc2: string = Index.shortLoc(loc);
-        const body: string = '出口 ' + Index.shortIp(ip) + (loc2.length > 0 ? ' · ' + loc2 : '');
-        FileStore.appendLog(this.filesDir, 'ipip raw: ' +
-          text.replace(/[\r\n]+/g, ' ').substring(0, 120));
-        return { text: body, suspect: Index.looksLocal(loc2) };
-      }
-    }
-    return { text: '', suspect: false };
+    FileStore.appendLog(this.filesDir, 'geoip primary empty, will retry (len=' +
+      String(primary.length) + ')');
+    return { text: '', suspect: false, ip: '' };
   }
 
   /** 解析 geoip JSON（api.ip.sb/geoip），失败返回 undefined */
@@ -1111,7 +1245,7 @@ struct Index {
       }
       const loc2: string = Index.shortLoc(parts.join(' '));
       const body: string = '出口 ' + Index.shortIp(ip) + (loc2.length > 0 ? ' · ' + loc2 : '');
-      return { text: body, suspect: code === 'CN' };
+      return { text: body, suspect: code === 'CN', ip: ip };
     } catch (err) {
       return undefined;
     }
@@ -1758,7 +1892,7 @@ struct Index {
 
   // ---------- 连接 ----------
 
-  async connect(): Promise<void> {
+  async connect(fromRecover: boolean = false): Promise<void> {
     if (this.running) {
       // 断开：先给界面反馈，再等系统真拆干净
       this.busy = true;
@@ -1773,6 +1907,20 @@ struct Index {
     if (this.selected < 0 || this.selected >= this.profiles.length) {
       this.toast.showToast({ message: '请先选择一个节点' });
       return;
+    }
+    // 用户主动发起连接：清除「主动停止」标记并允许立即申请长时任务。
+    // 自动恢复（fromRecover=true）不改该标记，其前提是 canAutoRecover() 已放行。
+    if (!fromRecover) {
+      KeepAliveManager.getInstance().setUserStopped(false);
+      // 取消挂起的自动恢复：否则它稍后触发 connect(true) 时 running 已为 true，
+      // 会误走进「断开」分支，把用户刚连上的 VPN 又断掉。
+      if (this.recoverTimer >= 0) {
+        clearTimeout(this.recoverTimer);
+        this.recoverTimer = -1;
+      }
+      this.recovering = false;
+      this.lostCount = 0;
+      this.recoverAttempt = 0;
     }
     this.busy = true;
     this.setStatus('正在连接…');
@@ -1792,6 +1940,11 @@ struct Index {
       };
       FileStore.appendLog(this.filesDir, 'start vpn extension');
       await vpnExtension.startVpnExtensionAbility(want);
+      // 每次建连成功都显式申请一次长时任务（force）。真机 14:10/14:14 两次
+      // 重连完全没有 started/failed 日志，根源就是旧实现只靠 readState 的
+      // false→true 边沿，组件内 running 与状态文件不同步时边沿会丢失。
+      // 这里独立于任何边沿兜底，确保后台期一定有长时任务保护。
+      this.requestKeepAlive();
       this.statusText = '正在启动内核…';
     } catch (err) {
       const message: string = String(err);
@@ -1837,6 +1990,20 @@ struct Index {
    */
   async disconnect(): Promise<void> {
     FileStore.appendLog(this.filesDir, 'disconnect requested');
+    // 用户主动停止：先落盘标记（杀进程不丢）。这是自动恢复与保活重申请的
+    // 唯一硬门禁，保证手动断开后不会被自动重连抢回去。
+    KeepAliveManager.getInstance().setUserStopped(true);
+    // 取消可能挂起的自动恢复，避免它把用户主动断开的连接又拉起来
+    if (this.recoverTimer >= 0) {
+      clearTimeout(this.recoverTimer);
+      this.recoverTimer = -1;
+    }
+    this.recovering = false;
+    this.lostCount = 0;
+    this.recoverAttempt = 0;
+    // 显式释放长时任务：本函数会先把 running 置 false 并写 state.json，
+    // readState() 的 true→false 边沿会因此丢失，不能只依赖它来 stop。
+    this.releaseKeepAlive();
     let stopped: boolean = false;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (await this.stopExtension()) {
@@ -1854,7 +2021,7 @@ struct Index {
       this.exitSeq++;
       this.exitBusy = false;
       this.exitInfo = '';
-      FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"}');
+      FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"' + FileStore.userStoppedField(this.filesDir) + '}');
       FileStore.appendLog(this.filesDir,
         'disconnect done, stopped=' + String(stopped));
       return;
@@ -2764,6 +2931,15 @@ struct Index {
           .backgroundColor(this.running ? '#EAF6EA' : '#F2F3F5')
           .border({ width: 1, color: this.running ? '#CFE8CF' : '#E2E4E8' })
           .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
+
+          // 长时任务连续申请失败时给出可见提示，不再静默地显示「已连接」
+          if (this.keepAliveWarn.length > 0) {
+            Text(this.keepAliveWarn)
+              .fontSize(12)
+              .fontColor('#B26A00')
+              .width('100%')
+              .padding({ left: 12, right: 12 })
+          }
 
           if (this.running) {
             // 出口 IP + 国家地区单独占一行：和流量挤在一起时地区会被省略掉

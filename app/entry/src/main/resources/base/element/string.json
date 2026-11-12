@@ -19,6 +19,10 @@
     {
       "name": "pasteboard_reason",
       "value": "从剪贴板导入节点分享链接"
+    },
+    {
+      "name": "keep_alive_reason",
+      "value": "VPN 代理在后台持续传输数据，避免隧道被系统中断"
     }
   ]
 }

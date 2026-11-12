@@ -1,6 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { Want } from '@kit.AbilityKit';
+import { Want, wantAgent, WantAgent } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { vpnExtension, VpnExtensionAbility, connection } from '@kit.NetworkKit';
 import { NgCore } from '../core/NgCore';
 import { FileStore } from '../core/FileStore';
@@ -13,6 +14,12 @@ const TUN_IP: string = '172.19.0.1';
 const TUN_DNS: string = '172.19.0.2';
 const TUN_PREFIX: number = 30;
 const TUN_MTU: number = 1400;
+
+/** 底层网络变化后重绑去抖（毫秒）：合并 WiFi/蜂窝切换瞬间连发的多个事件 */
+const REBIND_DELAY_MS: number = 400;
+/** conn.protect() 连续失败多少次后降级：本版本对 Go 内核 socket 因 MANAGE_VPN
+ * 权限必然失败，避免每条出站 socket 都做一次系统调用 + hilog 刷屏 */
+const PROTECT_FAIL_THRESHOLD: number = 20;
 
 function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve: () => void) => {
@@ -35,6 +42,17 @@ export default class VpnExtAbility extends VpnExtensionAbility {
   private delayTimer: number = -1;
   private started: boolean = false;
   private lastDelaySeq: number = -1;
+  private bgRunning: boolean = false;
+
+  /** 底层网络绑定：binding 为可重入互斥；boundNetId 记录当前目标，实现幂等跳过 */
+  private binding: boolean = false;
+  private boundNetId: number = -1;
+  /** 网络变化监听（NetConnection）与重绑去抖定时器 */
+  private netConn: connection.NetConnection | undefined = undefined;
+  private rebindTimer: number = -1;
+  /** protect 连续失败计数与降级开关 */
+  private protectFailStreak: number = 0;
+  private protectDisabled: boolean = false;
 
   onCreate(want: Want): void {
     hilog.info(DOMAIN, TAG, 'VpnExtAbility onCreate');
@@ -54,7 +72,18 @@ export default class VpnExtAbility extends VpnExtensionAbility {
       clearInterval(this.delayTimer);
       this.delayTimer = -1;
     }
+    // 先关掉重绑门禁，再停去抖定时器与监听，避免销毁流程里仍触发一次 setAppNet
     this.started = false;
+    if (this.rebindTimer >= 0) {
+      clearTimeout(this.rebindTimer);
+      this.rebindTimer = -1;
+    }
+    this.unregisterNetObserver();
+    this.binding = false;
+    this.boundNetId = -1;
+    this.protectDisabled = false;
+    this.protectFailStreak = 0;
+    this.releaseKeepAlive();
     // 先落盘「已断开」：NgCore.stop 可能阻塞，绝不能让状态文件停在 running=true，
     // 否则界面会一直显示「已连接 / 停止代理」，点断开也无效。
     this.writeState(false, '已断开');
@@ -83,8 +112,10 @@ export default class VpnExtAbility extends VpnExtensionAbility {
 
   private writeState(running: boolean, message: string): void {
     const filesDir: string = this.context.filesDir;
+    // 带上 userStopped 字段，避免扩展进程覆盖写把用户「主动停止」意图抹掉
     FileStore.writeText(FileStore.statePath(filesDir),
-      JSON.stringify({ running: running, message: message }));
+      '{"running":' + String(running) + ',"message":' + JSON.stringify(message) +
+      FileStore.userStoppedField(filesDir) + '}');
   }
 
   private async startCore(want: Want): Promise<void> {
@@ -162,15 +193,65 @@ export default class VpnExtAbility extends VpnExtensionAbility {
       // 绑定后的对照探针：用一个国内公共目标验证出站是否仍在回环
       hilog.info(DOMAIN, TAG, 'dial probe = %{public}s', NgCore.probeDial('223.5.5.5', 443, 5000));
 
-      // 内核出站 socket 保护：Go 线程 -> NAPI -> ArkTS protect(fd) -> 回填结果
+      // 内核出站 socket 保护：Go 线程 -> NAPI -> ArkTS protect(fd) -> 回填结果。
+      // 本版本 protect() 对 Go 内核自建 socket 必因 MANAGE_VPN 权限失败，连续失败达阈值后
+      // 降级：不再发起系统调用，直接回填 false，避免大流量时权限校验刷屏。
       NgCore.setProtectHandler((id: number, socketFd: number) => {
-        conn.protect(socketFd).then(() => {
-          hilog.debug(DOMAIN, TAG, 'protect ok fd = %{public}d', socketFd);
-          NgCore.protectDone(id, true);
-        }).catch((err: Error) => {
-          hilog.warn(DOMAIN, TAG, 'protect fd %{public}d failed: %{public}s', socketFd, err.message);
-          NgCore.protectDone(id, false);
-        });
+        // settled 由短路 / then / 链式 catch / 外层 catch 四条回填路径共用。
+        // 先置位再回填：protectDone 自身抛错时会流转到链式 catch，若未置位就会
+        // 对同一 id 二次回填；回填异常就地吞掉，整个 handler 不再向外抛，避免挂死内核。
+        let settled: boolean = false;
+        try {
+          if (this.protectDisabled) {
+            settled = true;
+            NgCore.protectDone(id, false);
+            return;
+          }
+          conn.protect(socketFd).then(() => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            this.protectFailStreak = 0;
+            hilog.debug(DOMAIN, TAG, 'protect ok fd = %{public}d', socketFd);
+            try {
+              NgCore.protectDone(id, true);
+            } catch (doneErr) {
+              hilog.error(DOMAIN, TAG, 'protectDone(true) threw: %{public}s', String(doneErr));
+            }
+          }).catch((err: Error) => {
+            if (settled) {
+              return; // then 已回填（含回填抛错流转），不二次回填、不重复计数
+            }
+            settled = true;
+            hilog.warn(DOMAIN, TAG, 'protect fd %{public}d failed: %{public}s', socketFd, err.message);
+            try {
+              NgCore.protectDone(id, false);
+            } catch (doneErr) {
+              hilog.error(DOMAIN, TAG, 'protectDone(false) threw: %{public}s', String(doneErr));
+            }
+            this.protectFailStreak++;
+            if (!this.protectDisabled && this.protectFailStreak >= PROTECT_FAIL_THRESHOLD) {
+              this.protectDisabled = true;
+              FileStore.appendLog(filesDir, 'protect disabled after ' +
+                String(this.protectFailStreak) + ' failures');
+            }
+          });
+        } catch (err) {
+          // conn.protect() 同步抛异常等非 Promise 路径：兜底回填一次，
+          // 否则 Go 侧拿不到结果会挂住回调，大流量下表现为断网。
+          if (!settled) {
+            settled = true;
+            try {
+              NgCore.protectDone(id, false);
+            } catch (doneErr) {
+              hilog.error(DOMAIN, TAG, 'protect fallback threw: %{public}s', String(doneErr));
+            }
+          }
+          // 只打一条系统日志，不写 vpn.log（240 行环形缓冲），避免刷屏挤掉排障记录
+          hilog.error(DOMAIN, TAG, 'protect handler threw id=%{public}d: %{public}s',
+            id, String(err));
+        }
       });
 
       const config: string = rawConfig.replace('__TUN_FD__', String(fd));
@@ -193,13 +274,73 @@ export default class VpnExtAbility extends VpnExtensionAbility {
       this.writeState(true, '已连接');
       FileStore.appendLog(filesDir, 'core started, state=running');
       this.startStatsLoop(filesDir);
+      // 底层网络（WiFi/蜂窝）变化后需重新 setAppNet，否则出站 socket 回环进 TUN
+      this.registerNetObserver();
+      // 长时任务保活改在 UI 进程申请（从扩展进程调会报 401：context 类型不被接受）
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'vpn create failed: %{public}s', String(err));
       this.writeState(false, '创建 VPN 失败：' + String(err));
     }
   }
 
+  /**
+   * 长时任务保活。
+   * 实测：不申请长时任务时，本扩展进程在后台会被系统直接回收——日志里只剩一行
+   * 「verify: no system vpn, force ui to disconnected」，没有任何 onDestroy，VPN 标志随之消失。
+   * 这里申请一次数据接续类型的连续任务，让进程拿到后台执行配额。
+   * 申请失败不影响 VPN 本身（隧道已经在跑），只把错误码记进日志便于定位。
+   */
+  private async requestKeepAlive(): Promise<void> {
+    const filesDir: string = this.context.filesDir;
+    try {
+      const info: wantAgent.WantAgentInfo = {
+        wants: [
+          {
+            bundleName: 'com.maoxu.v2rayng',
+            abilityName: 'EntryAbility'
+          }
+        ],
+        operationType: wantAgent.OperationType.START_ABILITY,
+        requestCode: 0,
+        wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+      };
+      const agent: WantAgent = await wantAgent.getWantAgent(info);
+      await backgroundTaskManager.startBackgroundRunning(this.context,
+        backgroundTaskManager.BackgroundMode.DATA_TRANSFER, agent);
+      this.bgRunning = true;
+      FileStore.appendLog(filesDir, 'continuous task started');
+    } catch (err) {
+      const be = err as BusinessError;
+      const code: number = be.code !== undefined ? be.code : -1;
+      hilog.error(DOMAIN, TAG, 'keep alive failed code=%{public}d msg=%{public}s',
+        code, String(be.message));
+      FileStore.appendLog(filesDir, 'continuous task failed code=' + String(code) +
+        ' msg=' + String(be.message));
+    }
+  }
+
+  private async releaseKeepAlive(): Promise<void> {
+    if (!this.bgRunning) {
+      return;
+    }
+    this.bgRunning = false;
+    const filesDir: string = this.context.filesDir;
+    try {
+      await backgroundTaskManager.stopBackgroundRunning(this.context);
+      FileStore.appendLog(filesDir, 'continuous task stopped');
+    } catch (err) {
+      const be = err as BusinessError;
+      FileStore.appendLog(filesDir, 'continuous task stop failed code=' +
+        String(be.code !== undefined ? be.code : -1));
+    }
+  }
+
   private async bindUnderlyingNetwork(): Promise<void> {
+    // 可重入互斥：网络变化回调可能连发，避免并发 setAppNet 交错
+    if (this.binding) {
+      return;
+    }
+    this.binding = true;
     try {
       const filesDir: string = this.context.filesDir;
       const nets: connection.NetHandle[] = await connection.getAllNets();
@@ -232,19 +373,120 @@ export default class VpnExtAbility extends VpnExtensionAbility {
         FileStore.appendLog(filesDir, 'no underlying net, keep default');
         return;
       }
+      // 幂等：目标底层网络未变则跳过，避免每次网络事件都做一次无效 setAppNet
+      if (target.netId === this.boundNetId) {
+        return;
+      }
+      const isRebind: boolean = this.boundNetId >= 0;
       await connection.setAppNet(target);
-      hilog.info(DOMAIN, TAG, 'app net bound to %{public}d (wifi/cellular)', target.netId);
-      FileStore.appendLog(filesDir, 'app net bound to ' + String(target.netId));
+      this.boundNetId = target.netId;
+      if (isRebind) {
+        hilog.info(DOMAIN, TAG, 'underlying net rebound to %{public}d', target.netId);
+        FileStore.appendLog(filesDir, 'underlying net rebound to ' + String(target.netId));
+      } else {
+        hilog.info(DOMAIN, TAG, 'app net bound to %{public}d (wifi/cellular)', target.netId);
+        FileStore.appendLog(filesDir, 'app net bound to ' + String(target.netId));
+      }
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'bind underlying net failed: %{public}s', String(err));
       FileStore.appendLog(this.context.filesDir, 'bind net failed: ' + String(err));
+    } finally {
+      this.binding = false;
     }
+  }
+
+  /**
+   * 注册底层网络变化监听。SDK 15 的 @ohos.net.connection 没有命名空间级 on/off，
+   * 事件走 createNetConnection() 得到的 NetConnection.on(type, cb) + register(cb)。
+   * 真机 20:30/20:40/20:50 的 netCapabilitiesChange 会连发多个，统一去抖后重绑。
+   */
+  private registerNetObserver(): void {
+    if (this.netConn !== undefined) {
+      return;
+    }
+    const filesDir: string = this.context.filesDir;
+    try {
+      const netConn: connection.NetConnection = connection.createNetConnection();
+      // 能力变化：只认底层网络，BEARER_VPN 是隧道自身，跳过避免误重绑
+      netConn.on('netCapabilitiesChange', (info: connection.NetCapabilityInfo): void => {
+        const bearers: connection.NetBearType[] = info.netCap.bearerTypes;
+        if (bearers !== undefined &&
+          bearers.indexOf(connection.NetBearType.BEARER_VPN) >= 0) {
+          return;
+        }
+        this.scheduleRebind();
+      });
+      netConn.on('netAvailable', (): void => {
+        this.scheduleRebind();
+      });
+      netConn.on('netLost', (): void => {
+        this.scheduleRebind();
+      });
+      netConn.on('netUnavailable', (): void => {
+        this.scheduleRebind();
+      });
+      // 先持有引用：即使 register 回调报错，onDestroy 也能注销，不留悬挂监听
+      this.netConn = netConn;
+      netConn.register((err: BusinessError): void => {
+        if (err !== null && err !== undefined) {
+          hilog.warn(DOMAIN, TAG, 'net observer register failed: %{public}s', String(err.message));
+          FileStore.appendLog(filesDir, 'net observer register failed: ' + String(err.message));
+        }
+      });
+      FileStore.appendLog(filesDir, 'net observer registered');
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'net observer setup failed: %{public}s', String(err));
+      FileStore.appendLog(filesDir, 'net observer setup failed: ' + String(err));
+    }
+  }
+
+  /** 注销网络监听。SDK 15 的 NetConnection 无 off()，用 unregister() 一次性取消。 */
+  private unregisterNetObserver(): void {
+    const netConn: connection.NetConnection | undefined = this.netConn;
+    this.netConn = undefined;
+    if (netConn === undefined) {
+      return;
+    }
+    try {
+      netConn.unregister((err: BusinessError): void => {
+        if (err !== null && err !== undefined) {
+          hilog.warn(DOMAIN, TAG, 'net observer unregister failed: %{public}s',
+            String(err.message));
+        }
+      });
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'net observer unregister threw: %{public}s', String(err));
+    }
+  }
+
+  /** 400ms 去抖后重绑底层网络；bindUnderlyingNetwork 自带互斥 + 幂等。 */
+  private scheduleRebind(): void {
+    if (!this.started) {
+      return;
+    }
+    if (this.rebindTimer >= 0) {
+      clearTimeout(this.rebindTimer);
+      this.rebindTimer = -1;
+    }
+    this.rebindTimer = setTimeout((): void => {
+      this.rebindTimer = -1;
+      if (!this.started) {
+        return;
+      }
+      this.bindUnderlyingNetwork().catch((err: Error): void => {
+        hilog.error(DOMAIN, TAG, 'rebind underlying net failed: %{public}s', err.message);
+        FileStore.appendLog(this.context.filesDir, 'rebind net failed: ' + err.message);
+      });
+    }, REBIND_DELAY_MS);
   }
 
   private startStatsLoop(filesDir: string): void {
     if (this.statsTimer >= 0) {
       clearInterval(this.statsTimer);
     }
+    // 后台降载：状态文件写入由 2s 降到 8s。真机 hilog 里 MANAGE_VPN 权限校验
+    // 失败每秒十几条刷屏，叠加高频定时器容易被系统判为「后台负载长时间高于
+    // 该类型典型负载」而挂起/回收进程。状态文件字段与格式保持完全不变。
     this.statsTimer = setInterval(() => {
       if (!this.started) {
         return;
@@ -264,11 +506,16 @@ export default class VpnExtAbility extends VpnExtensionAbility {
         body = body.substring(0, body.length - 1);
       }
       FileStore.writeText(FileStore.statePath(filesDir),
-        '{"running":true,"message":"已连接",' + body + '}');
+        '{"running":true,"message":"已连接",' + body +
+        FileStore.userStoppedField(filesDir) + '}');
+      // 纯前台测速桥由 2s 一并降到 8s：扩展进程没有前后台回调，
+      // 后台时界面不写 delay_req.json，函数读到空内容会立即返回（等效跳过）。
+      // 保留调用而不删除，避免破坏既有 delay req/res 测速文件协议。
       this.handleDelayRequest(filesDir);
-    }, 2000);
+    }, 8000);
 
-    // 并发测速的取队列：界面按 seq 各写一个请求文件，这里高频扫描并全部提交
+    // 并发测速取队列由 300ms 降到 1.5s（空队列时 listDelayReqs 直接返回）。
+    // 这是后台最高频的一项：原来每秒 3 次列目录，现在约每 1.5s 一次。
     if (this.delayTimer >= 0) {
       clearInterval(this.delayTimer);
     }
@@ -277,7 +524,7 @@ export default class VpnExtAbility extends VpnExtensionAbility {
         return;
       }
       this.drainDelayQueue(filesDir);
-    }, 300);
+    }, 1500);
   }
 
   /**
