@@ -1149,6 +1149,18 @@ struct Index {
       }
       return;
     }
+    // 兜底：连续 12 枪（约 1 分钟）仍是中国大陆归属，说明这一枪不是「VPN 刚被回收、
+    // 走了家宽」的短暂窗口，而是用户确实选了国内节点（或归属库误判）。照实显示，
+    // 否则界面会永远停在「正在测出口 IP…」且无法手动重测。
+    if (text.length > 0 && attempt >= 12) {
+      FileStore.appendLog(this.filesDir, 'exit probe accept suspect after ' +
+        String(attempt) + ' attempts: ' + text);
+      this.exitBusy = false;
+      if (this.exitInfo !== text) {
+        this.exitInfo = text;
+      }
+      return;
+    }
     // 空结果 = 隧道还没通；归属中国大陆 = 这一枪走了家宽直连（VPN 刚被回收那几秒会这样）。
     // 两种都不能显示成出口。实测冷启动时节点的中转链路要 20 秒以上才通，前几枪全是超时，
     // 所以前 6 枪按 2.5~4 秒紧凑重试，之后放慢到 8 秒继续重试（期间界面保持「正在测」）。

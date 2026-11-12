@@ -1,7 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { Want, wantAgent, WantAgent } from '@kit.AbilityKit';
+import { Want } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { vpnExtension, VpnExtensionAbility, connection } from '@kit.NetworkKit';
 import { NgCore } from '../core/NgCore';
 import { FileStore } from '../core/FileStore';
@@ -42,7 +41,6 @@ export default class VpnExtAbility extends VpnExtensionAbility {
   private delayTimer: number = -1;
   private started: boolean = false;
   private lastDelaySeq: number = -1;
-  private bgRunning: boolean = false;
 
   /** 底层网络绑定：binding 为可重入互斥；boundNetId 记录当前目标，实现幂等跳过 */
   private binding: boolean = false;
@@ -83,7 +81,7 @@ export default class VpnExtAbility extends VpnExtensionAbility {
     this.boundNetId = -1;
     this.protectDisabled = false;
     this.protectFailStreak = 0;
-    this.releaseKeepAlive();
+    // 长时任务由 UI 进程持有，本进程不释放（从扩展进程 stop 会作用到别人的任务上）
     // 先落盘「已断开」：NgCore.stop 可能阻塞，绝不能让状态文件停在 running=true，
     // 否则界面会一直显示「已连接 / 停止代理」，点断开也无效。
     this.writeState(false, '已断开');
@@ -284,57 +282,10 @@ export default class VpnExtAbility extends VpnExtensionAbility {
   }
 
   /**
-   * 长时任务保活。
-   * 实测：不申请长时任务时，本扩展进程在后台会被系统直接回收——日志里只剩一行
-   * 「verify: no system vpn, force ui to disconnected」，没有任何 onDestroy，VPN 标志随之消失。
-   * 这里申请一次数据接续类型的连续任务，让进程拿到后台执行配额。
-   * 申请失败不影响 VPN 本身（隧道已经在跑），只把错误码记进日志便于定位。
+   * 长时任务保活不在这里做：本扩展进程的 context 不被后台任务接口接受，
+   * 从这个进程调用 startBackgroundRunning 会报 401「context 类型不合法」。
+   * 保活统一由 UI 进程的 KeepAliveManager 申请（那里是 UIAbilityContext）。
    */
-  private async requestKeepAlive(): Promise<void> {
-    const filesDir: string = this.context.filesDir;
-    try {
-      const info: wantAgent.WantAgentInfo = {
-        wants: [
-          {
-            bundleName: 'com.maoxu.v2rayng',
-            abilityName: 'EntryAbility'
-          }
-        ],
-        operationType: wantAgent.OperationType.START_ABILITY,
-        requestCode: 0,
-        wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      };
-      const agent: WantAgent = await wantAgent.getWantAgent(info);
-      await backgroundTaskManager.startBackgroundRunning(this.context,
-        backgroundTaskManager.BackgroundMode.DATA_TRANSFER, agent);
-      this.bgRunning = true;
-      FileStore.appendLog(filesDir, 'continuous task started');
-    } catch (err) {
-      const be = err as BusinessError;
-      const code: number = be.code !== undefined ? be.code : -1;
-      hilog.error(DOMAIN, TAG, 'keep alive failed code=%{public}d msg=%{public}s',
-        code, String(be.message));
-      FileStore.appendLog(filesDir, 'continuous task failed code=' + String(code) +
-        ' msg=' + String(be.message));
-    }
-  }
-
-  private async releaseKeepAlive(): Promise<void> {
-    if (!this.bgRunning) {
-      return;
-    }
-    this.bgRunning = false;
-    const filesDir: string = this.context.filesDir;
-    try {
-      await backgroundTaskManager.stopBackgroundRunning(this.context);
-      FileStore.appendLog(filesDir, 'continuous task stopped');
-    } catch (err) {
-      const be = err as BusinessError;
-      FileStore.appendLog(filesDir, 'continuous task stop failed code=' +
-        String(be.code !== undefined ? be.code : -1));
-    }
-  }
-
   private async bindUnderlyingNetwork(): Promise<void> {
     // 可重入互斥：网络变化回调可能连发，避免并发 setAppNet 交错
     if (this.binding) {
