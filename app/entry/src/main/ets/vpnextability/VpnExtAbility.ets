@@ -54,6 +54,8 @@ export default class VpnExtAbility extends VpnExtensionAbility {
 
   onCreate(want: Want): void {
     hilog.info(DOMAIN, TAG, 'VpnExtAbility onCreate');
+    // 本进程（:vpn）的日志写 vpn.log；显式设置，避免将来同进程复用时串到 ui.log。
+    FileStore.setLogChannel('vpn');
     FileStore.appendLog(this.context.filesDir, 'extension onCreate');
     this.startCore(want);
   }

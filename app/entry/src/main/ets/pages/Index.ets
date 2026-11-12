@@ -214,6 +214,14 @@ struct Index {
   @State exitBusy: boolean = false;
   /** 出口检测的请求代际：切节点/断开时自增，旧请求的结果回来直接作废 */
   private exitSeq: number = 0;
+  /** 连续空结果（握手失败/超时）枪数；拿到任一非空结果即清零 */
+  private exitEmptyStreak: number = 0;
+  /** 最近一次订阅重建后，原选中节点是否原样保留（server+port+uuid 全等）；true 则不必重连 */
+  private selectedKept: boolean = true;
+  /** 已熔断：当前节点无可用出口，exitInfo 是提示文案而非真出口，置灰显示 */
+  @State exitBlocked: boolean = false;
+  /** 连续多少枪全空后停止重试（约 1 分钟），避免死节点上无限转圈 */
+  static readonly EXIT_EMPTY_LIMIT: number = 8;
   @State summary: string = 'mihomo 内核 · 国内直连 / 国外代理';
   @State linkInput: string = '';
   @State subInput: string = '';
@@ -557,6 +565,8 @@ struct Index {
         this.running = state.running;
         if (this.running) {
           // 刚连上，隧道还没稳，稍等一下再测出口
+          this.exitEmptyStreak = 0;
+          this.exitBlocked = false;
           this.scheduleExitRefresh(2000, 1);
           // 连上立即申请一次长时任务（force）：不再只依赖边沿触发。
           // 真机 14:10/14:14 重连时边沿丢失导致 69 分钟后台无保活，
@@ -565,6 +575,8 @@ struct Index {
         } else {
           this.exitSeq++;
           this.exitBusy = false;
+          this.exitEmptyStreak = 0;
+          this.exitBlocked = false;
           if (this.exitInfo.length > 0) {
             this.exitInfo = '';
           }
@@ -724,6 +736,8 @@ struct Index {
       this.switchTimer = -1;
       this.reconnectSoon();
       // 换了节点，出口 IP 会变：等重连完成再重新测一次
+      this.exitEmptyStreak = 0;
+      this.exitBlocked = false;
       this.scheduleExitRefresh(3200, 1);
     }, 800);
   }
@@ -1141,6 +1155,11 @@ struct Index {
     if (seq !== this.exitSeq) {
       return;
     }
+    // 拿到任一非空结果（真出口或归属判定）都说明探测链路通了，清空连续失败计数
+    if (text.length > 0) {
+      this.exitEmptyStreak = 0;
+      this.exitBlocked = false;
+    }
     if (text.length > 0 && !suspect) {
       // 非大陆归属 = 真出口，直接显示
       this.exitBusy = false;
@@ -1165,12 +1184,24 @@ struct Index {
     // 两种都不能显示成出口。实测冷启动时节点的中转链路要 20 秒以上才通，前几枪全是超时，
     // 所以前 6 枪按 2.5~4 秒紧凑重试，之后放慢到 8 秒继续重试（期间界面保持「正在测」）。
     if (this.running) {
+      // 连续空结果达到上限：当前节点出站不通（死节点 / 被干扰），停止重试并提示换节点；
+      // 否则在死节点上会每几秒无限转圈。手动点出口卡再重新探测。
+      this.exitEmptyStreak++;
+      if (this.exitEmptyStreak >= Index.EXIT_EMPTY_LIMIT) {
+        FileStore.appendLog(this.filesDir, 'exit probe blocked after ' +
+          String(this.exitEmptyStreak) + ' empty attempts, stop retrying');
+        this.exitBusy = false;
+        this.exitBlocked = true;
+        this.exitInfo = '当前节点无可用出口，请切换节点';
+        return;
+      }
       const fast: boolean = attempt < 6;
       const delayMs: number = fast ? (text.length === 0 ? 2500 : 4000) : 8000;
       this.scheduleExitRefresh(delayMs, attempt + 1);
       return;
     }
     this.exitBusy = false;
+    this.exitBlocked = false;
     if (this.exitInfo.length > 0) {
       this.exitInfo = '';
     }
@@ -1275,6 +1306,10 @@ struct Index {
         return -1;
       }
     }
+    // 重建前记住当前选中节点身份。同源节点被清空后再追加新节点，数组下标会重排；
+    // 若只按下标钳制，selected 会漂移到列表里同下标的另一个节点（可能不通）。
+    const prev: Profile | undefined = this.selected >= 0 && this.selected < this.profiles.length
+      ? this.profiles[this.selected] : undefined;
     const list: Profile[] = this.profiles.filter((item: Profile) => item.subId !== url).slice();
     const baseId: string = String(Date.now()) + '_' + Index.subSeq();
     let added: number = 0;
@@ -1292,7 +1327,44 @@ struct Index {
       }
     });
     this.saveAll(list);
+    this.selectedKept = false;
+    if (prev !== undefined) {
+      const hit: number = this.findProfileByIdentity(list, prev);
+      if (hit >= 0) {
+        this.selected = hit;
+        const cur: Profile = list[hit];
+        // 只有 server+port+uuid 全等才算原节点原样保留；仅 server+port 命中说明凭据/端口变了，仍需重连
+        this.selectedKept = cur.server === prev.server && cur.port === prev.port &&
+          (cur.uuid || '') === (prev.uuid || '');
+      } else {
+        this.selected = 0;
+      }
+    }
     return added;
+  }
+
+  /**
+   * 在新列表里按节点身份找回原选中项：优先 server+port+uuid，退到 server+port，再退到 name；找不到返回 -1。
+   */
+  private findProfileByIdentity(list: Profile[], prev: Profile): number {
+    for (let i = 0; i < list.length; i++) {
+      const p: Profile = list[i];
+      if (p.server === prev.server && p.port === prev.port && (p.uuid || '') === (prev.uuid || '')) {
+        return i;
+      }
+    }
+    for (let i = 0; i < list.length; i++) {
+      const p: Profile = list[i];
+      if (p.server === prev.server && p.port === prev.port) {
+        return i;
+      }
+    }
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].name === prev.name) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   /** 订阅导入序号：同一毫秒内多次导入也不会撞 id。 */
@@ -1330,7 +1402,10 @@ struct Index {
     }
     this.drawerOpen = false;
     this.toast.showToast({ message: '订阅导入 ' + added + ' 个节点' });
-    this.reconnectSoon();
+    // 原选中节点原样保留时，当前隧道配置没变，不必断开重连
+    if (!this.selectedKept) {
+      this.reconnectSoon();
+    }
   }
 
   /** 单个订阅分组更新：只刷新这个订阅的节点，其它分组不动。 */
@@ -1354,7 +1429,10 @@ struct Index {
       return;
     }
     this.toast.showToast({ message: '已更新 ' + added + ' 个节点' });
-    this.reconnectSoon();
+    // 原选中节点原样保留时，当前隧道配置没变，不必断开重连
+    if (!this.selectedKept) {
+      this.reconnectSoon();
+    }
   }
 
   /** 单个分组测速：只测这一组的节点。 */
@@ -1384,7 +1462,7 @@ struct Index {
   }
 
   /** 测速并发上限：内核侧是 goroutine，这里控制同时排队请求数。 */
-  static TEST_CONCURRENCY: number = 16;
+  static TEST_CONCURRENCY: number = 24;
 
   /** 并发池：固定 concurrency 个 worker 从队列里取节点去测，测完更新进度。 */
   async runPool(indices: number[], concurrency: number): Promise<void> {
@@ -1417,11 +1495,19 @@ struct Index {
   // ---------- 节点操作 ----------
 
   removeProfile(index: number): void {
+    // 删除前记住选中节点身份：删在它前面会让下标前移，删的就是它则回退到末位
+    const prev: Profile | undefined = this.selected >= 0 && this.selected < this.profiles.length
+      ? this.profiles[this.selected] : undefined;
     const list: Profile[] = this.profiles.slice();
     list.splice(index, 1);
     this.saveAll(list);
-    if (this.selected >= list.length) {
-      this.selected = list.length - 1;
+    if (prev !== undefined) {
+      const hit: number = this.findProfileByIdentity(list, prev);
+      if (hit >= 0) {
+        this.selected = hit;
+      } else if (this.selected >= list.length) {
+        this.selected = list.length - 1;
+      }
     }
     this.toast.showToast({ message: '已删除' });
     this.reconnectSoon();
@@ -1535,8 +1621,9 @@ struct Index {
     const resFile: string = FileStore.delayResFile(this.filesDir, seq);
     FileStore.writeText(reqFile, JSON.stringify(req));
     let delay: number = -1;
-    // 远节点握手慢，最多等 30 秒（60 × 500ms）
-    for (let i = 0; i < 60; i++) {
+    // 内核侧测速超时 5 秒，扩展桥扫描间隔 1.5 秒；这里最多等 10 秒（20 × 500ms），
+    // 等不到就回填 -1。死节点不该占着并发槽拖垮整批排序。
+    for (let i = 0; i < 20; i++) {
       await Index.sleep(500);
       const text: string = FileStore.readText(resFile);
       if (text.length === 0) {
@@ -1629,9 +1716,9 @@ struct Index {
     return String(value) + ' ms';
   }
 
-  /** 清除本机运行日志（vpn.log）。系统日志 hilog 归系统所有，应用无权清理。 */
+  /** 清除本机运行日志（ui.log + vpn.log）。系统日志 hilog 归系统所有，应用无权清理。 */
   clearRunLog(): void {
-    FileStore.removeFile(FileStore.logPath(this.filesDir));
+    FileStore.clearLogs(this.filesDir);
     this.toast.showToast({ message: '运行日志已清除' });
   }
 
@@ -2032,6 +2119,8 @@ struct Index {
       this.totalText = '';
       this.exitSeq++;
       this.exitBusy = false;
+      this.exitEmptyStreak = 0;
+      this.exitBlocked = false;
       this.exitInfo = '';
       FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"' + FileStore.userStoppedField(this.filesDir) + '}');
       FileStore.appendLog(this.filesDir,
@@ -2957,17 +3046,19 @@ struct Index {
             // 出口 IP + 国家地区单独占一行：和流量挤在一起时地区会被省略掉
             Text(this.exitInfo.length > 0 ? this.exitInfo : (this.exitBusy ? '正在测出口 IP…' : '点此测出口 IP'))
               .fontSize(14)
-              .fontColor(this.exitInfo.length > 0 ? '#2E7D32' : '#7A7A7A')
+              .fontColor(this.exitBlocked ? '#7A7A7A' : (this.exitInfo.length > 0 ? '#2E7D32' : '#7A7A7A'))
               .width('100%')
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .padding({ left: 12, right: 12, top: 9, bottom: 9 })
               .borderRadius(10)
-              .backgroundColor('#EAF6EA')
-              .border({ width: 1, color: '#CFE8CF' })
+              .backgroundColor(this.exitBlocked ? '#F2F3F5' : '#EAF6EA')
+              .border({ width: 1, color: this.exitBlocked ? '#E2E4E8' : '#CFE8CF' })
               .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
               .onClick(() => {
                 if (!this.exitBusy) {
+                  this.exitEmptyStreak = 0;
+                  this.exitBlocked = false;
                   this.refreshExit(1);
                 }
               })

@@ -52,14 +52,35 @@ export class FileStore {
     }
   }
 
-  /** 运行日志路径。日志只落本机沙盒，界面可以一键清除。 */
-  static logPath(filesDir: string): string {
-    return FileStore.ensureDir(filesDir) + '/vpn.log';
+  /**
+   * 当前进程的日志通道。界面进程与 VPN 扩展进程是两个独立进程（:vpn），
+   * 静态变量各进程互不影响：UI 在 EntryAbility.onCreate 里切成 'ui'，
+   * 扩展在 VpnExtAbility.onCreate 里显式设回 'vpn'。
+   */
+  private static logChannel: string = 'vpn';
+
+  /** 切换日志通道；只认 'ui'，其余一律按扩展进程的 'vpn' 处理。 */
+  static setLogChannel(channel: string): void {
+    FileStore.logChannel = channel === 'ui' ? 'ui' : 'vpn';
   }
 
   /**
-   * 追加一行运行日志（vpn.log）。界面进程与扩展进程都会写同一个文件，
-   * 这里用「读旧 + 截断 + 重写」的方式，并保留最近 240 行，避免越写越大。
+   * 运行日志路径。界面进程写 ui.log，扩展进程写 vpn.log。
+   * 分文件的原因：appendLog 是「读全文件 + 整文件重写」，两个进程同时写同一文件
+   * 会互相覆盖丢行，交错截断还会在文件里留下 NUL 空洞。
+   */
+  static logPath(filesDir: string): string {
+    return FileStore.ensureDir(filesDir) +
+      (FileStore.logChannel === 'ui' ? '/ui.log' : '/vpn.log');
+  }
+
+  /** 指定通道的日志路径，读日志与清除时按通道各取一份。 */
+  static logPathOf(filesDir: string, channel: string): string {
+    return FileStore.ensureDir(filesDir) + (channel === 'ui' ? '/ui.log' : '/vpn.log');
+  }
+
+  /**
+   * 追加一行运行日志。各通道各自保留最近 240 行。
    */
   static appendLog(filesDir: string, line: string): void {
     try {
@@ -77,6 +98,26 @@ export class FileStore {
       FileStore.writeText(path, lines.join('\n'));
     } catch (err) {
     }
+  }
+
+  /** 读全部运行日志：两个通道合并，行首是 HH:MM:SS，按字典序即按时间序。 */
+  static readLogs(filesDir: string): string[] {
+    let lines: string[] = [];
+    const vpnText: string = FileStore.readText(FileStore.logPathOf(filesDir, 'vpn'));
+    const uiText: string = FileStore.readText(FileStore.logPathOf(filesDir, 'ui'));
+    if (vpnText.length > 0) {
+      lines = lines.concat(vpnText.split('\n'));
+    }
+    if (uiText.length > 0) {
+      lines = lines.concat(uiText.split('\n'));
+    }
+    return lines.filter((l: string) => l.length > 0).sort();
+  }
+
+  /** 清除全部运行日志（两条通道都删）。 */
+  static clearLogs(filesDir: string): void {
+    FileStore.removeFile(FileStore.logPathOf(filesDir, 'vpn'));
+    FileStore.removeFile(FileStore.logPathOf(filesDir, 'ui'));
   }
 
   static profilesPath(filesDir: string): string {

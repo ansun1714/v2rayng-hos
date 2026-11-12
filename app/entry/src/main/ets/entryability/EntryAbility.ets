@@ -2,6 +2,7 @@ import { common, AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { KeepAliveManager } from '../core/KeepAliveManager';
+import { FileStore } from '../core/FileStore';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'V2rayNG';
@@ -9,6 +10,9 @@ const TAG: string = 'V2rayNG';
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'EntryAbility onCreate');
+    // 界面进程的日志走 ui.log，与扩展进程的 vpn.log 分开，避免两个进程
+    // 「读全文件 + 整文件重写」同一文件时互相覆盖、截断出 NUL 空洞。
+    FileStore.setLogChannel('ui');
     // 注入应用级 UIAbilityContext：长时任务必须由它申请，且 userStopped 的
     // 持久化要在页面出现、用户点击之前就恢复完成。
     KeepAliveManager.getInstance().init(this.context as common.UIAbilityContext);
