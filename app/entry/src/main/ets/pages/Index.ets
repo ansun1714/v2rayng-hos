@@ -1469,6 +1469,12 @@ struct Index {
     }
     this.statusText = '正在拉取订阅…';
     const body: string = await this.httpGet(url, 15000);
+    // 拉取期间可能开始了「全部更新」：已飞行的这次导入不能再 applySubContent，
+    // 否则会在批量合并阶段多写一次盘并可能多触发一次重连。同时恢复上面设的进度文案。
+    if (this.updatingAll) {
+      this.statusText = this.running ? '已连接' : '未连接';
+      return;
+    }
     if (body.trim().length === 0) {
       this.toast.showToast({ message: '订阅拉取失败，检查链接或网络' });
       this.statusText = this.running ? '已连接' : '未连接';
@@ -1506,6 +1512,12 @@ struct Index {
     }
     this.statusText = '正在更新订阅…';
     const body: string = await this.httpGet(url, 15000);
+    // 拉取期间可能开始了「全部更新」：已飞行的单组更新必须与批量合并互斥，
+    // 否则会多写一次盘并可能多触发一次重连。同时恢复上面设的进度文案。
+    if (this.updatingAll) {
+      this.statusText = this.running ? '已连接' : '未连接';
+      return;
+    }
     if (body.trim().length === 0) {
       this.toast.showToast({ message: '订阅更新失败，检查网络' });
       this.statusText = this.running ? '已连接' : '未连接';
@@ -1611,7 +1623,7 @@ struct Index {
     this.updatingAll = true;
     this.updDone = 0;
     this.updTotal = targets.length;
-    this.updInfo = '已更新 0 · 待更新 ' + String(this.updTotal);
+    this.updInfo = '已处理 0 · 待更新 ' + String(this.updTotal);
     let okSubs: number = 0;
     let failed: number = 0;
     let addedTotal: number = 0;
@@ -1628,10 +1640,15 @@ struct Index {
             return;
           }
           const url: string = targets[at];
-          const body: string = await this.httpGet(url, 15000);
+          // 单请求超时：给每个 URL 一个确定上界，httpGet 的 promise 永不 settle 时
+          // 16s 后返回 '' 判为该订阅失败，worker 继续推进，Promise.all 与 finally 必然执行。
+          // 不用整体 race（超时后 worker 仍在飞行会游离写 bodies/updDone），也不加看门狗定时器。
+          const timeout: Promise<string> = Index.sleep(16000).then((): string => '');
+          const body: string = await Promise.race([this.httpGet(url, 15000), timeout]);
           bodies.set(url, body);
           this.updDone = this.updDone + 1;
-          this.updInfo = '已更新 ' + String(this.updDone) + ' · 待更新 ' +
+          // 「已处理」含拉取失败的请求，不表示成功；成功订阅数在汇总 toast 里单独统计
+          this.updInfo = '已处理 ' + String(this.updDone) + ' · 待更新 ' +
             String(this.updTotal - this.updDone);
         }
       };
@@ -1717,6 +1734,8 @@ struct Index {
         if (bad > 0) {
           msg += ' (' + String(bad) + ' 个失败/跳过)';
         }
+        // 内核只在启动时读一次配置：选中节点未变时不重连，新增节点要下次重连才生效
+        msg += '，新节点下次重连后生效';
       }
       this.toast.showToast({ message: msg });
       FileStore.appendLog(this.filesDir, 'updateAll: ok=' + String(okSubs) + ' failed=' +
@@ -2880,6 +2899,7 @@ struct Index {
           .width('100%')
           .height(44)
           .fontSize(15)
+          .enabled(!this.updatingAll)
           .onClick(() => {
             this.importSubscription();
           })
