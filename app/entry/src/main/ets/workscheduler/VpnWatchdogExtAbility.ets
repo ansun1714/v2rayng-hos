@@ -10,7 +10,8 @@
  * ⚠ 独立进程注意：
  * - KeepAliveManager 的静态单例在这里是另一个实例，不能用，也不 import Index；
  *   判定一律直接读 state.json 与 state.json 的 mtime（心跳）。
- * - 日志走 ui 通道（FileStore.setLogChannel('ui')），便于与 UI 侧时间线对齐取证。
+ * - 日志走 watchdog 独立通道（FileStore.setLogChannel('watchdog')）：
+ *   避免与 UI 进程整文件重写互相覆盖导致 tick 丢失；readLogs 仍会合并三通道保持时间线。
  *
  * 判定条件与主链路保持一致（防误连）：userStopped === false 且
  *   (running === true  且 心跳超过 30s 未更新)   —— 扩展被硬杀，状态文件残留「已连接」
@@ -43,8 +44,9 @@ export default class VpnWatchdogExtAbility extends WorkSchedulerExtensionAbility
   /** 系统按周期唤起：只做「判定 + 写日志 + 必要恢复」，不做任何 UI 操作。 */
   onWorkStart(work: workScheduler.WorkInfo): void {
     const filesDir: string = this.context.filesDir;
-    // 看门狗是独立进程，日志切到 ui 通道，和 UI/扩展两侧时间线能对上
-    FileStore.setLogChannel('ui');
+    // 看门狗是独立进程，日志走 watchdog 独立通道：避免与 UI 进程整文件重写互相覆盖
+    // 导致 tick 丢失；readLogs 仍会合并三通道保持时间线
+    FileStore.setLogChannel('watchdog');
     let running: boolean = false;
     let message: string = '';
     let userStopped: boolean = false;
@@ -76,7 +78,7 @@ export default class VpnWatchdogExtAbility extends WorkSchedulerExtensionAbility
   }
 
   onWorkStop(work: workScheduler.WorkInfo): void {
-    FileStore.setLogChannel('ui');
+    FileStore.setLogChannel('watchdog');
     FileStore.appendLog(this.context.filesDir,
       'watchdog: work stop, workId=' + String(work.workId));
   }

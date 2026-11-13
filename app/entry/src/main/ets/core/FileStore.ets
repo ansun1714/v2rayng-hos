@@ -53,30 +53,44 @@ export class FileStore {
   }
 
   /**
-   * 当前进程的日志通道。界面进程与 VPN 扩展进程是两个独立进程（:vpn），
+   * 当前进程的日志通道。UI、VPN 扩展（:vpn）、WorkScheduler 看门狗是三个独立进程，
    * 静态变量各进程互不影响：UI 在 EntryAbility.onCreate 里切成 'ui'，
-   * 扩展在 VpnExtAbility.onCreate 里显式设回 'vpn'。
+   * VPN 扩展在 VpnExtAbility.onCreate 里显式设回 'vpn'，
+   * 看门狗在 VpnWatchdogExtAbility 里切成 'watchdog'。
    */
   private static logChannel: string = 'vpn';
 
-  /** 切换日志通道；只认 'ui'，其余一律按扩展进程的 'vpn' 处理。 */
+  /** 切换日志通道；只认 'ui' / 'watchdog'，其余（含 'vpn'）一律按扩展进程的 'vpn' 处理。 */
   static setLogChannel(channel: string): void {
-    FileStore.logChannel = channel === 'ui' ? 'ui' : 'vpn';
+    FileStore.logChannel = channel === 'ui' || channel === 'watchdog' ? channel : 'vpn';
   }
 
   /**
-   * 运行日志路径。界面进程写 ui.log，扩展进程写 vpn.log。
-   * 分文件的原因：appendLog 是「读全文件 + 整文件重写」，两个进程同时写同一文件
-   * 会互相覆盖丢行，交错截断还会在文件里留下 NUL 空洞。
+   * 通道 → 日志文件名的唯一映射。logPath 与 logPathOf 都走这里，
+   * 避免两处三元分支各自维护、将来漏改 watchdog 通道。
+   */
+  private static logFileOf(channel: string): string {
+    if (channel === 'ui') {
+      return '/ui.log';
+    }
+    if (channel === 'watchdog') {
+      return '/watchdog.log';
+    }
+    return '/vpn.log';
+  }
+
+  /**
+   * 运行日志路径。UI 进程写 ui.log，VPN 扩展写 vpn.log，看门狗扩展写 watchdog.log。
+   * 三个进程各写一份，避免并发整文件重写互相覆盖：appendLog 是「读全文件 + 整文件重写」，
+   * 多个进程同时写同一文件会互相覆盖丢行，交错截断还会在文件里留下 NUL 空洞。
    */
   static logPath(filesDir: string): string {
-    return FileStore.ensureDir(filesDir) +
-      (FileStore.logChannel === 'ui' ? '/ui.log' : '/vpn.log');
+    return FileStore.ensureDir(filesDir) + FileStore.logFileOf(FileStore.logChannel);
   }
 
   /** 指定通道的日志路径，读日志与清除时按通道各取一份。 */
   static logPathOf(filesDir: string, channel: string): string {
-    return FileStore.ensureDir(filesDir) + (channel === 'ui' ? '/ui.log' : '/vpn.log');
+    return FileStore.ensureDir(filesDir) + FileStore.logFileOf(channel);
   }
 
   /**
@@ -100,24 +114,29 @@ export class FileStore {
     }
   }
 
-  /** 读全部运行日志：两个通道合并，行首是 HH:MM:SS，按字典序即按时间序。 */
+  /** 读全部运行日志：三个通道合并，行首是 HH:MM:SS，按字典序即按时间序。 */
   static readLogs(filesDir: string): string[] {
     let lines: string[] = [];
     const vpnText: string = FileStore.readText(FileStore.logPathOf(filesDir, 'vpn'));
     const uiText: string = FileStore.readText(FileStore.logPathOf(filesDir, 'ui'));
+    const watchdogText: string = FileStore.readText(FileStore.logPathOf(filesDir, 'watchdog'));
     if (vpnText.length > 0) {
       lines = lines.concat(vpnText.split('\n'));
     }
     if (uiText.length > 0) {
       lines = lines.concat(uiText.split('\n'));
     }
+    if (watchdogText.length > 0) {
+      lines = lines.concat(watchdogText.split('\n'));
+    }
     return lines.filter((l: string) => l.length > 0).sort();
   }
 
-  /** 清除全部运行日志（两条通道都删）。 */
+  /** 清除全部运行日志（三条通道都删）。 */
   static clearLogs(filesDir: string): void {
     FileStore.removeFile(FileStore.logPathOf(filesDir, 'vpn'));
     FileStore.removeFile(FileStore.logPathOf(filesDir, 'ui'));
+    FileStore.removeFile(FileStore.logPathOf(filesDir, 'watchdog'));
   }
 
   static profilesPath(filesDir: string): string {
