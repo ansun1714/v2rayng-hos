@@ -232,6 +232,11 @@ struct Index {
   @State testDone: number = 0;
   @State testTotal: number = 0;
   @State testInfo: string = '';
+  /** 全部更新：互斥标志 + 已完成 / 待完成计数 + 进度文案（卡片样式与测速进度一致） */
+  @State updatingAll: boolean = false;
+  @State updDone: number = 0;
+  @State updTotal: number = 0;
+  @State updInfo: string = '';
   /** 列表重建戳：分组 ForEach 的 key 靠它变化才会重新渲染 */
   @State stamp: number = 0;
   /** 分组已展开的节点页数（每页 PAGE_SIZE 个），改变它触发列表重绘 */
@@ -1390,6 +1395,12 @@ struct Index {
       } catch (err) {
       }
     });
+    // 订阅返回空、或所有行都解析失败：绝不落盘。
+    // 否则 filter 掉整组旧节点后 saveAll 会把该订阅清空并写进磁盘，一次网络抖动就丢节点。
+    // 返回 0（而非 -1）：调用方据此提示「已保留原节点」，同时 selectedKept 不变、不会误触发重连。
+    if (added === 0) {
+      return 0;
+    }
     this.saveAll(list);
     this.selectedKept = false;
     if (prev !== undefined) {
@@ -1440,6 +1451,9 @@ struct Index {
 
   /** 订阅导入：支持 base64 或明文的一行一个分享链接，重导时覆盖同源节点。 */
   async importSubscription(): Promise<void> {
+    if (this.updatingAll) {
+      return;
+    }
     const url: string = this.subInput.trim();
     // 只接受 https：明文 http 会把订阅 token 和节点凭据暴露给同一网络里的任何中间人，
     // 对方还能改写返回内容，塞进自己的节点或把域名改成直连。
@@ -1474,6 +1488,10 @@ struct Index {
 
   /** 单个订阅分组更新：只刷新这个订阅的节点，其它分组不动。 */
   async refreshGroup(url: string): Promise<void> {
+    if (this.updatingAll) {
+      this.toast.showToast({ message: '正在全部更新，稍后再试' });
+      return;
+    }
     // 老版本允许 http 导入的订阅会落到这里；手动节点组没有刷新按钮，传进来的必然是订阅地址
     if (!url.toLowerCase().startsWith('https://')) {
       this.toast.showToast({ message: '该订阅是明文 http，已拒绝更新；请改用 https 地址重新导入' });
@@ -1488,14 +1506,199 @@ struct Index {
     }
     const added: number = this.applySubContent(url, body);
     this.statusText = this.running ? '已连接' : '未连接';
-    if (added < 0) {
-      this.toast.showToast({ message: '订阅内容无法解析' });
+    // added === 0：订阅内容为空（applySubContent 已保留旧节点且不落盘），别再误报「已更新 0 个节点」
+    if (added <= 0) {
+      this.toast.showToast({ message: added === 0 ? '订阅内容为空，已保留原节点' : '订阅内容无法解析' });
       return;
     }
     this.toast.showToast({ message: '已更新 ' + added + ' 个节点' });
     // 原选中节点原样保留时，当前隧道配置没变，不必断开重连
     if (!this.selectedKept) {
       this.reconnectSoon();
+    }
+  }
+
+  /**
+   * 纯解析订阅内容：把 body 解成节点数组，不碰 this.profiles、不落盘、不做名称去重。
+   * 名称去重留到合并阶段统一做；返回空数组表示这次拉取或解析失败，合并时保留旧节点不动。
+   */
+  private parseSubNodes(url: string, body: string, idSeed: string): Profile[] {
+    let content: string = body;
+    if (!content.includes('://')) {
+      try {
+        content = ProxyLink.decodeBase64(content);
+      } catch (err) {
+        return [];
+      }
+    }
+    const nodes: Profile[] = [];
+    const lines: string[] = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const text: string = lines[i].trim();
+      if (text.length === 0) {
+        continue;
+      }
+      try {
+        const fresh: Profile = ProxyLink.toProfile(text, idSeed + '_' + String(nodes.length), url);
+        nodes.push(fresh);
+      } catch (err) {
+        // 单行链接格式不对就跳过，不影响其它行
+      }
+    }
+    return nodes;
+  }
+
+  /**
+   * 「全部更新」：并发拉取所有订阅 → 串行合并到临时数组 → 一次落盘 → 一次身份找回 → 一次重连判定。
+   * 刻意不循环调用 refreshGroup：后者每个订阅都弹 toast、改 statusText、末尾 reconnectSoon，
+   * N 个订阅会造成 N 次真实断线重连；applySubContent 每次都 filter 全量 + saveAll 重写整个
+   * profiles + bump 重建列表，批量写会互相覆盖；且空内容时会把该组旧节点清空落盘。
+   */
+  async updateAllSubscriptions(): Promise<void> {
+    if (this.updatingAll) {
+      return;
+    }
+    if (this.testing) {
+      this.toast.showToast({ message: '正在测速，稍后再更新订阅' });
+      return;
+    }
+    // 直接遍历 profiles 按 subId 去重：groupList 依赖缓存且受折叠/分页影响，不能用于批量
+    const seen: Set<string> = new Set<string>();
+    const allUrls: string[] = [];
+    for (let i = 0; i < this.profiles.length; i++) {
+      const sub: string = this.profiles[i].subId !== undefined ? this.profiles[i].subId : '';
+      if (sub.length === 0 || seen.has(sub)) {
+        continue;
+      }
+      seen.add(sub);
+      allUrls.push(sub);
+    }
+    if (allUrls.length === 0) {
+      this.toast.showToast({ message: '还没有订阅，请先在左侧「订阅与导入」里添加' });
+      return;
+    }
+    // 与 refreshGroup 语义一致：非 https 的旧订阅只计入跳过，绝不发起明文请求
+    const targets: string[] = [];
+    let skipped: number = 0;
+    for (let i = 0; i < allUrls.length; i++) {
+      if (allUrls[i].toLowerCase().startsWith('https://')) {
+        targets.push(allUrls[i]);
+      } else {
+        skipped++;
+      }
+    }
+    if (targets.length === 0) {
+      this.toast.showToast({ message: '订阅均非 https 地址，请改用 https 重新导入' });
+      return;
+    }
+
+    this.updatingAll = true;
+    this.updDone = 0;
+    this.updTotal = targets.length;
+    this.updInfo = '已更新 0 · 待更新 ' + String(this.updTotal);
+    let okSubs: number = 0;
+    let failed: number = 0;
+    let addedTotal: number = 0;
+
+    try {
+      // 并发拉取上限 3：照抄 runPool 的 cursor / worker / Promise.all 结构
+      const bodies: Map<string, string> = new Map<string, string>();
+      const cursor: number[] = [0];
+      const worker = async (): Promise<void> => {
+        while (true) {
+          const at: number = cursor[0];
+          cursor[0] = cursor[0] + 1;
+          if (at >= targets.length) {
+            return;
+          }
+          const url: string = targets[at];
+          const body: string = await this.httpGet(url, 15000);
+          bodies.set(url, body);
+          this.updDone = this.updDone + 1;
+          this.updInfo = '已更新 ' + String(this.updDone) + ' · 待更新 ' +
+            String(this.updTotal - this.updDone);
+        }
+      };
+      const workers: Promise<void>[] = [];
+      const count: number = Math.min(3, targets.length);
+      for (let w = 0; w < count; w++) {
+        workers.push(worker());
+      }
+      await Promise.all(workers);
+
+      // prev 必须在拉取完成后才取：拉取期间状态可能已被用户操作改变
+      const prev: Profile | undefined = this.selected >= 0 && this.selected < this.profiles.length
+        ? this.profiles[this.selected] : undefined;
+
+      // 串行合并到临时数组，全程不碰 this.profiles、不落盘
+      let list: Profile[] = this.profiles.slice();
+      const seq: string = String(Date.now()) + '_' + Index.subSeq();
+      for (let i = 0; i < targets.length; i++) {
+        const url: string = targets[i];
+        const raw: string | undefined = bodies.get(url);
+        const body: string = raw !== undefined ? raw as string : '';
+        // 每个订阅用独立的 id 前缀，避免不同订阅的节点 id 相撞
+        const nodes: Profile[] = this.parseSubNodes(url, body, seq + '_' + String(i));
+        if (nodes.length === 0) {
+          failed++;
+          // 只记序号，不写订阅 URL：URL 带 token（见 httpGet 的注释）
+          FileStore.appendLog(this.filesDir,
+            'updateAll: sub #' + String(i) + ' fetch/parse empty, keep old nodes');
+          continue;
+        }
+        list = list.filter((p: Profile) => p.subId !== url);
+        for (let n = 0; n < nodes.length; n++) {
+          const fresh: Profile = nodes[n];
+          fresh.name = this.uniqueName(list, fresh.name);
+          list.push(fresh);
+        }
+        okSubs++;
+        addedTotal += nodes.length;
+      }
+
+      // 一次落盘：没有任何订阅成功时绝不写盘
+      if (okSubs > 0) {
+        this.saveAll(list);
+        // 一次身份找回 + 一次重连判定，语义与 applySubContent 一致：
+        // 仅 server+port 或 name 命中说明凭据变了，仍需重连
+        if (prev !== undefined) {
+          const hit: number = this.findProfileByIdentity(list, prev);
+          this.selected = hit >= 0 ? hit : 0;
+          let kept: boolean = false;
+          if (hit >= 0) {
+            const cur: Profile = list[hit];
+            kept = cur.server === prev.server && cur.port === prev.port &&
+              (cur.uuid || '') === (prev.uuid || '');
+          }
+          this.selectedKept = kept;
+          if (!kept) {
+            this.reconnectSoon();
+          }
+        }
+      }
+
+      // 全程只弹一个汇总 toast，互斥提示不在此路径内
+      let msg: string = '';
+      const bad: number = failed + skipped;
+      if (okSubs === 0) {
+        msg = '订阅更新失败，已保留原有节点 (' + String(bad) + ' 个失败/跳过)';
+      } else {
+        msg = '已更新 ' + String(okSubs) + '/' + String(this.updTotal) + ' 个订阅 · 共 ' +
+          String(addedTotal) + ' 个节点';
+        if (bad > 0) {
+          msg += ' (' + String(bad) + ' 个失败/跳过)';
+        }
+      }
+      this.toast.showToast({ message: msg });
+      FileStore.appendLog(this.filesDir, 'updateAll: ok=' + String(okSubs) + ' failed=' +
+        String(failed) + ' skipped=' + String(skipped) + ' nodes=' + String(addedTotal));
+    } catch (err) {
+      // 只记固定文案，不写订阅 URL
+      FileStore.appendLog(this.filesDir, 'updateAll: unexpected error');
+      this.toast.showToast({ message: '订阅更新异常，已保留原有节点' });
+    } finally {
+      this.updatingAll = false;
+      this.updInfo = '';
     }
   }
 
@@ -1731,6 +1934,9 @@ struct Index {
   }
 
   async testAll(): Promise<void> {
+    if (this.updatingAll) {
+      return;
+    }
     if (!this.running) {
       this.toast.showToast({ message: '请先连接，内核起来后才能测速' });
       return;
@@ -3168,19 +3374,38 @@ struct Index {
               .border({ width: 1, color: '#EDD6C9' })
               .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
           }
+
+          // 全部更新进度：与测速进度同款橙色卡片
+          if (this.updInfo.length > 0) {
+            Text(this.updInfo).fontSize(14).fontColor('#B25B3E')
+              .width('100%')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+              .borderRadius(10)
+              .backgroundColor('#FBF1EC')
+              .border({ width: 1, color: '#EDD6C9' })
+              .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
+          }
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
 
         Row({ space: 10 }) {
-          Button('添加节点').layoutWeight(1).height(38).fontSize(15)
+          Button('添加节点').layoutWeight(1).height(38).fontSize(14)
             .backgroundColor('#F0F0F0').fontColor('#333333')
             .onClick(() => {
               this.addNew();
             })
-          Button(this.testing ? '测速中…' : '全部测速').layoutWeight(1).height(38).fontSize(15)
+          Button(this.updatingAll ? '更新中…' : '全部更新').layoutWeight(1).height(38).fontSize(14)
             .backgroundColor('#F0F0F0').fontColor('#333333')
-            .enabled(!this.testing)
+            .enabled(!this.updatingAll && !this.testing)
+            .onClick(() => {
+              this.updateAllSubscriptions();
+            })
+          Button(this.testing ? '测速中…' : '全部测速').layoutWeight(1).height(38).fontSize(14)
+            .backgroundColor('#F0F0F0').fontColor('#333333')
+            .enabled(!this.testing && !this.updatingAll)
             .onClick(() => {
               this.testAll();
             })
