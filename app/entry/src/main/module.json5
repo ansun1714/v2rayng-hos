@@ -43,6 +43,12 @@
         "description": "$string:vpn_desc",
         "type": "vpn",
         "exported": false
+      },
+      {
+        "name": "VpnWatchdogExtAbility",
+        "srcEntry": "./ets/workscheduler/VpnWatchdogExtAbility.ets",
+        "type": "workScheduler",
+        "exported": false
       }
     ],
     "requestPermissions": [
