@@ -52,6 +52,15 @@ export default class EntryAbility extends UIAbility {
       .catch((err: Error) => {
         hilog.error(DOMAIN, TAG, 'ensure onForeground failed: %{public}s', err.message);
       });
+    // 冷启动 / 回前台兜底：页面组件被系统回收时，这一层比页面定时器更可靠。
+    // 只做「异常断开 + 已过冷却」判定并登记请求，由 Index 在 aboutToAppear
+    // 或 1s pollTimer 中消费后调 scheduleRecover()。
+    // 全工程仅 Index.connectInternal 一处允许 startVpnExtensionAbility，
+    // 这里绝不直接拉起扩展；一次性登记标志保证不会与页面重复触发。
+    const filesDir: string = (this.context as common.UIAbilityContext).filesDir;
+    if (mgr.requestColdStartHeal(filesDir)) {
+      FileStore.appendLog(filesDir, 'cold start recover requested by onForeground');
+    }
   }
 
   /** 切后台：同样复核一次；无业务或用户已停止时管理器会自行跳过。 */

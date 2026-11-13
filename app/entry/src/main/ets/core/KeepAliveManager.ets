@@ -30,6 +30,13 @@ const COOLDOWN_MS: number = 30000;
 /** 连续失败达到该次数即认为保活不可用，供界面提示，不再静默 */
 const WARN_STREAK: number = 2;
 
+/** 冷启动自愈判定所需的 state.json 字段（其余统计字段忽略，兼容字段缺失）。 */
+interface ColdStartState {
+  running?: boolean;
+  message?: string;
+  userStopped?: boolean;
+}
+
 export class KeepAliveManager {
   private static instance: KeepAliveManager | undefined = undefined;
 
@@ -44,6 +51,10 @@ export class KeepAliveManager {
   private ensuring: boolean = false;
   private lastStopAt: number = 0;
   private loaded: boolean = false;
+  /** 冷启动自愈：进程内只登记一次，避免 Index 与 EntryAbility 重复触发 */
+  private coldStartHealDone: boolean = false;
+  /** 待页面消费的自愈请求：EntryAbility 不能直接调页面的 scheduleRecover() */
+  private coldStartHealPending: boolean = false;
 
   private constructor() {
   }
@@ -232,6 +243,59 @@ export class KeepAliveManager {
       return '';
     }
     return '后台保活未启用，切后台可能被系统断开';
+  }
+
+  /**
+   * 判定 state.json 是否表示「扩展异常销毁、非用户主动停止」。
+   * 双校验缺一不可：userStopped 必须显式为 false，message 必须恰好是「已断开」
+   * （该文案只由 VpnExtAbility.onDestroy 写出；用户主动停止写「未连接」）。
+   * 字段缺失兼容：running/message/userStopped 分别按 false/''/false 处理。
+   * 扩展 writeState() 会带上 userStopped，所以用户主动停止的意图不会被覆盖丢失。
+   */
+  isAbnormalDisconnect(filesDir: string): boolean {
+    const text: string = FileStore.readText(FileStore.statePath(filesDir));
+    if (text.length === 0) {
+      return false;
+    }
+    let running: boolean = false;
+    let message: string = '';
+    let userStopped: boolean = false;
+    try {
+      const state: ColdStartState = JSON.parse(text) as ColdStartState;
+      running = state.running === undefined ? false : state.running;
+      message = state.message === undefined ? '' : state.message;
+      userStopped = state.userStopped === undefined ? false : state.userStopped;
+    } catch (err) {
+      return false;
+    }
+    return !running && userStopped === false && message === '已断开';
+  }
+
+  /**
+   * 一次性登记冷启动自愈请求。Index.aboutToAppear 与 EntryAbility.onForeground
+   * 都会调用；单例 + coldStartHealDone 保证进程内只登记一次。
+   * canAutoRecover() 再挡一道「用户主动停止 / 停止后立即重申请」红线；
+   * scheduleRecover() 内部还会把 cooldownRemaining() 并入延迟。
+   */
+  requestColdStartHeal(filesDir: string): boolean {
+    if (this.coldStartHealDone || !this.canAutoRecover()) {
+      return false;
+    }
+    if (!this.isAbnormalDisconnect(filesDir)) {
+      return false;
+    }
+    this.coldStartHealDone = true;
+    this.coldStartHealPending = true;
+    return true;
+  }
+
+  /** 取走并清除待处理的冷启动自愈请求（页面侧调用）。 */
+  consumeColdStartHeal(): boolean {
+    if (!this.coldStartHealPending) {
+      return false;
+    }
+    this.coldStartHealPending = false;
+    return true;
   }
 
   /** onForeground / onBackground 的状态快照，便于真机一次抓日志定位 */

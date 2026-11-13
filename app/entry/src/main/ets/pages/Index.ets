@@ -303,6 +303,10 @@ struct Index {
   private recoverAttempt: number = 0;
   /** 自动恢复退避定时器 */
   private recoverTimer: number = -1;
+  /** 连接入口互斥：恢复定时器 / 用户点击 / 节点切换并发时只允许一路启动扩展 */
+  private connecting: boolean = false;
+  /** 冷启动自愈一次性标志（与 KeepAliveManager 的进程内标志形成双保险） */
+  private coldStartHealTriggered: boolean = false;
   /** 后台保活不可用提示（长时任务连续申请失败时显示，不再静默） */
   @State keepAliveWarn: string = '';
 
@@ -357,12 +361,18 @@ struct Index {
     }
     this.pollTimer = setInterval(() => {
       this.readState();
+      // 消费 EntryAbility.onForeground 登记的冷启动自愈请求：只读布尔，不额外读文件
+      this.tryColdStartRecover(false);
     }, 1000);
     // 系统 VPN 是否真的还在，3 秒校验一次：状态文件可能是扩展被强杀前的残留
     this.watchTimer = setInterval(() => {
       this.verifyRunning();
     }, 3000);
     this.verifyRunning();
+    // 冷启动自愈：UI 进程被系统回收后重新拉起时，扩展 onDestroy 已把 state.json
+    // 写成 running=false，verifyRunning() 首行直接短路，自动恢复永远排不上。
+    // 仅「非用户主动停止 + 扩展异常销毁文案」双条件成立时才排一次恢复。
+    this.tryColdStartRecover(true);
   }
 
   aboutToDisappear(): void {
@@ -440,6 +450,35 @@ struct Index {
     this.statusText = '未连接';
     this.totalText = '';
     FileStore.writeText(FileStore.statePath(this.filesDir), '{"running":false,"message":"未连接"' + FileStore.userStoppedField(this.filesDir) + '}');
+  }
+
+  /**
+   * 冷启动自愈（进程内一次性）。
+   * checkState=true 仅由 aboutToAppear 调用，顺带做一次 state.json 判定；
+   * checkState=false 供 1s pollTimer 使用，只消费 EntryAbility.onForeground
+   * 登记的请求，避免每秒重复读文件。
+   * 触发条件在 KeepAliveManager.isAbnormalDisconnect() 中双校验，缺一不可：
+   * !running && userStopped === false && message === '已断开'。
+   * 用户主动停止落盘的是「未连接」+ userStopped=true，绝不会被自动抢连回来。
+   * 复用 scheduleRecover()：保留 5→10→20→60s 退避、8 次尝试上限、
+   * Math.max(delay, cooldownRemaining()) 与 canAutoRecover() 冷却门禁，
+   * 不新增 state.json 字段。
+   */
+  private tryColdStartRecover(checkState: boolean): void {
+    if (this.coldStartHealTriggered) {
+      return;
+    }
+    const mgr: KeepAliveManager = KeepAliveManager.getInstance();
+    if (checkState) {
+      mgr.requestColdStartHeal(this.filesDir);
+    }
+    if (!mgr.consumeColdStartHeal()) {
+      return;
+    }
+    this.coldStartHealTriggered = true;
+    FileStore.appendLog(this.filesDir,
+      'cold start recover: abnormal disconnect (running=false, message=已断开, userStopped=false)');
+    this.scheduleRecover();
   }
 
   /**
@@ -1991,7 +2030,27 @@ struct Index {
 
   // ---------- 连接 ----------
 
+  /**
+   * 连接入口互斥：自动恢复定时器、用户点击、节点切换重连可能同一秒并发，
+   * 旧实现无互斥，出现同秒两次 startVpnExtensionAbility（22:40:22/25、
+   * 06:47:01/02）并伴随 onCreate→onDestroy→onCreate。这里串行化所有入口，
+   * finally 保证任何提前 return 路径都复位 connecting。
+   */
   async connect(fromRecover: boolean = false): Promise<void> {
+    if (this.connecting) {
+      FileStore.appendLog(this.filesDir, 'connect: skipped, another connect in progress');
+      return;
+    }
+    this.connecting = true;
+    try {
+      await this.connectInternal(fromRecover);
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  /** 实际连接流程；只由 connect() 调用，保证入口互斥与状态复位。 */
+  private async connectInternal(fromRecover: boolean): Promise<void> {
     if (this.running) {
       // 断开：先给界面反馈，再等系统真拆干净
       this.busy = true;
@@ -2029,7 +2088,15 @@ struct Index {
       if (await this.hasSystemVpn()) {
         FileStore.appendLog(this.filesDir, 'connect: stale vpn found, stopping first');
         await this.stopExtension();
-        await this.waitVpnGone(3000);
+        const gone: boolean = await this.waitVpnGone(3000);
+        // 去重：拆干净后系统 VPN 又立刻出现，说明另一路已拉起扩展。
+        // 本轮不再 startVpnExtensionAbility，杜绝同秒双 start 与
+        // onCreate→onDestroy→onCreate；入口 connecting 互斥是另一道保险。
+        if (gone && (await this.hasSystemVpn())) {
+          FileStore.appendLog(this.filesDir,
+            'connect: vpn alive after stale cleanup, skip duplicate start');
+          return;
+        }
       }
       const config: string = ConfigBuilder.build(this.profiles, this.selected, this.rules);
       FileStore.writeText(FileStore.configPath(this.filesDir), config);
