@@ -363,6 +363,8 @@ struct Index {
       this.readState();
       // 消费 EntryAbility.onForeground 登记的冷启动自愈请求：只读布尔，不额外读文件
       this.tryColdStartRecover(false);
+      // 消费 onForeground 的系统 VPN 交叉校验结果（state 说已连接、实际无 :vpn）
+      this.consumeNeedRecover();
     }, 1000);
     // 系统 VPN 是否真的还在，3 秒校验一次：状态文件可能是扩展被强杀前的残留
     this.watchTimer = setInterval(() => {
@@ -371,8 +373,10 @@ struct Index {
     this.verifyRunning();
     // 冷启动自愈：UI 进程被系统回收后重新拉起时，扩展 onDestroy 已把 state.json
     // 写成 running=false，verifyRunning() 首行直接短路，自动恢复永远排不上。
-    // 仅「非用户主动停止 + 扩展异常销毁文案」双条件成立时才排一次恢复。
+    // 仅「非用户主动停止 + 扩展已死」双条件成立时才排一次恢复。
     this.tryColdStartRecover(true);
+    // 冷启动时 onForeground 早于页面加载：这里补消费一次交叉校验标记
+    this.consumeNeedRecover();
   }
 
   aboutToDisappear(): void {
@@ -476,8 +480,29 @@ struct Index {
       return;
     }
     this.coldStartHealTriggered = true;
-    FileStore.appendLog(this.filesDir,
-      'cold start recover: abnormal disconnect (running=false, message=已断开, userStopped=false)');
+    // 两种异常来源分开记：扩展走了 onDestroy（abnormal disconnect）vs 被 SIGKILL、
+    // state.json 残留 running:true（stale heartbeat，靠 mtime 超 30s 判定）。
+    FileStore.appendLog(this.filesDir, 'cold start recover: ' + mgr.abnormalKind(this.filesDir) +
+      ' (userStopped=false)');
+    this.scheduleRecover();
+  }
+
+  /**
+   * 消费 EntryAbility.onForeground 的系统 VPN 交叉校验结果。
+   * 为什么需要：state.json 里的 running 可能是扩展被 SIGKILL 前残留的「已连接」，
+   * 只信文案会永久卡在假连接；而 onForeground 是系统稳定投递的生命周期回调，
+   * 不受应用冻结影响，是唯一可靠的纠错时点。用户主动停止 / 冷却中一律不恢复。
+   */
+  private consumeNeedRecover(): void {
+    if (AppStorage.get<boolean>('needRecover') !== true) {
+      return;
+    }
+    AppStorage.setOrCreate<boolean>('needRecover', false);
+    const mgr: KeepAliveManager = KeepAliveManager.getInstance();
+    if (mgr.isUserStopped() || !mgr.canAutoRecover()) {
+      return;
+    }
+    FileStore.appendLog(this.filesDir, 'recover: needRecover consumed (onForeground cross-check)');
     this.scheduleRecover();
   }
 

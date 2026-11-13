@@ -14,19 +14,21 @@
  * 冷却窗口与自动恢复门禁。
  */
 import { common, wantAgent, WantAgent } from '@kit.AbilityKit';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { BusinessError, Callback } from '@kit.BasicServicesKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
+import { connection } from '@kit.NetworkKit';
+import { fileIo } from '@kit.CoreFileKit';
 import { FileStore } from './FileStore';
 
 const BUNDLE_NAME: string = 'com.maoxu.v2rayng';
 const ENTRY_ABILITY: string = 'EntryAbility';
-/** 常态复核间隔：≥30s，避免「系统取消/暂停长时任务后立即再次申请」红线 */
+/** 常态复核间隔：≥30s 真调一次 startBackgroundRunning，作为系统侧任务的健康探针 */
 const ENSURE_INTERVAL_MS: number = 30000;
-/** force 调用的最小去重间隔：连接成功路径与 readState 边沿可能相隔几百毫秒
- * 连续触发，2s 内只申请一次，避免重复 startBackgroundRunning */
-const FORCE_MIN_GAP_MS: number = 2000;
 /** stop 成功后的冷却窗口（官方要求不得在停止后立即再次申请） */
 const COOLDOWN_MS: number = 30000;
+/** state.json 心跳阈值：扩展 statsTimer 每 8s 重写一次状态文件，
+ * 超过 30s（≈3.75 个写入周期）没更新即判定扩展进程已死 */
+const HEARTBEAT_STALE_MS: number = 30000;
 /** 连续失败达到该次数即认为保活不可用，供界面提示，不再静默 */
 const WARN_STREAK: number = 2;
 
@@ -55,6 +57,13 @@ export class KeepAliveManager {
   private coldStartHealDone: boolean = false;
   /** 待页面消费的自愈请求：EntryAbility 不能直接调页面的 scheduleRecover() */
   private coldStartHealPending: boolean = false;
+  /** 保存 UIAbilityContext：continuousTaskCancel 回调里要用它立即重申请 */
+  private ctx: common.UIAbilityContext | undefined = undefined;
+  /** 取消监听句柄：保证 off 时传同一引用，避免重复注册 */
+  private cancelListener: Callback<backgroundTaskManager.ContinuousTaskCancelInfo> | undefined =
+    undefined;
+  /** 是否已注册取消监听（进程内一次） */
+  private cancelRegistered: boolean = false;
 
   private constructor() {
   }
@@ -73,11 +82,79 @@ export class KeepAliveManager {
    */
   init(ctx: common.UIAbilityContext): void {
     this.filesDir = ctx.filesDir;
+    // 取消回调里拿不到 ctx，必须在这里留一份引用，才能「被取消后立即重申请」
+    this.ctx = ctx;
+    this.registerCancelListener();
     if (this.loaded) {
       return;
     }
     this.loaded = true;
     this.userStopped = FileStore.readUserStopped(this.filesDir);
+  }
+
+  /**
+   * 注册连续任务取消回调（API 15+，签名见
+   * @ohos.resourceschedule.backgroundTaskManager.d.ts L427）。
+   * 为什么必须有：真机 11-13 挂机断连后 state.json 残留 running:true、且没有任何
+   * 定时器日志，此前完全看不到「系统把长时任务取消了」这件事。ContinuousTaskCancelReason
+   * 里明确有 SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED（dataTransfer 模式低速被取消），
+   * 夜间几乎无流量时最容易命中——这条监听把「静默丢失」变成「可观测 + 可自愈」。
+   */
+  private registerCancelListener(): void {
+    if (this.cancelRegistered) {
+      return;
+    }
+    const listener: Callback<backgroundTaskManager.ContinuousTaskCancelInfo> =
+      (info: backgroundTaskManager.ContinuousTaskCancelInfo): void => {
+        this.onContinuousTaskCancelled(info);
+      };
+    try {
+      // 幂等：重复 on 同一个 type 会报 401（参数错误），所以先 off 再 on
+      if (this.cancelListener !== undefined) {
+        backgroundTaskManager.off('continuousTaskCancel', this.cancelListener);
+      }
+      backgroundTaskManager.on('continuousTaskCancel', listener);
+      this.cancelListener = listener;
+      this.cancelRegistered = true;
+    } catch (err) {
+      const be: BusinessError = err as BusinessError;
+      FileStore.appendLog(this.filesDir, 'continuous task cancel listen failed code=' +
+        String(be.code !== undefined ? be.code : -1));
+    }
+  }
+
+  /** 连续任务被取消：记原因 → 置失效 → 立即重申请（用户主动停止时跳过）。 */
+  private onContinuousTaskCancelled(info: backgroundTaskManager.ContinuousTaskCancelInfo): void {
+    const reason: number = info.reason;
+    FileStore.appendLog(this.filesDir, 'continuous task cancelled, reason=' + String(reason) +
+      '(' + this.cancelReasonText(reason) + ') taskId=' + String(info.id));
+    this.keepAliveOk = false;
+    this.noteTaskCancelled();
+    const ctx: common.UIAbilityContext | undefined = this.ctx;
+    if (ctx === undefined || !this.canAutoRecover()) {
+      return;
+    }
+    this.ensureRunning(ctx, true).catch((err: Error) => {
+      FileStore.appendLog(this.filesDir, 're-apply after cancel failed: ' + err.message);
+    });
+  }
+
+  /** 取消原因码 → 可读文案（枚举值见 ContinuousTaskCancelReason，API 15） */
+  private cancelReasonText(reason: number): string {
+    switch (reason) {
+      case backgroundTaskManager.ContinuousTaskCancelReason.USER_CANCEL:
+        return 'user_cancel';
+      case backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL:
+        return 'system_cancel';
+      case backgroundTaskManager.ContinuousTaskCancelReason.USER_CANCEL_REMOVE_NOTIFICATION:
+        return 'user_cancel_remove_notification';
+      case backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED:
+        return 'system_cancel_data_transfer_low_speed';
+      case backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_USE_ILLEGALLY:
+        return 'system_cancel_use_illegally';
+      default:
+        return 'other';
+    }
   }
 
   /** VPN 是否真的在运行：以 state.json 为准，没有业务时不申请（一致性校验） */
@@ -108,19 +185,16 @@ export class KeepAliveManager {
       return;
     }
     const now: number = Date.now();
-    // 节流放在任何 IO 之前：readState() 每 1s 调一次本方法，绝大多数
-    // 调用只做时间戳比较就返回，不加剧 IO / 并发写冲突。
-    // force 也做 2s 去重：connect 成功路径与 readState 边沿可能紧邻触发。
-    const gap: number = force ? FORCE_MIN_GAP_MS : ENSURE_INTERVAL_MS;
-    if (now - this.lastEnsureAt < gap) {
+    // 节流放在任何 IO 之前：readState() 每 1s 调一次本方法，绝大多数调用只做
+    // 时间戳比较就返回；force（连上瞬间 / 回到前台 / 任务被取消）立即真调一次。
+    // ⚠ 这里刻意**不再**保留「keepAliveOk 已持有就直接返回」的盲短路：上一版
+    // 正是它让系统侧任务被取消后永不重申请、永不报错，也把 onForeground 的
+    // force 复核一起吃掉了，最终形成真机 11-13 23:23 之后「UI 说已连接、实际
+    // 没有 :vpn」的静默假连接。重复申请由系统返回 9800005 兜底（见下方幂等分支）。
+    if (!force && now - this.lastEnsureAt < ENSURE_INTERVAL_MS) {
       return;
     }
     if (this.ensuring) {
-      return;
-    }
-    // 已持有短路：任务已在系统里且未被 noteTaskCancelled()/stop() 标记失效时，
-    // 不再重复申请（真机 21:21:19 起证明重复申请会被拒为 9800005 并刷失败日志）。
-    if (this.keepAliveOk) {
       return;
     }
     this.lastEnsureAt = now;
@@ -150,9 +224,15 @@ export class KeepAliveManager {
       // 失败幂等：系统报「已申请过连续任务」说明任务实际在持有（force 路径与
       // 系统状态失同步的兜底），视为成功，不计失败、不增 failStreak。
       if (code === 9800005 && msg.indexOf('applied for a continuous task') !== -1) {
+        const wasOk: boolean = this.keepAliveOk;
+        // 先置 true 再返回，保证状态一致（不能提前 return 而不改状态）
         this.keepAliveOk = true;
         this.failStreak = 0;
-        FileStore.appendLog(filesDir, 'continuous task already applied, treat as ok');
+        // 30s 周期的真复核每次都会命中这条，若每次都记会把 240 行环形日志冲掉，
+        // 只在「从异常恢复为已持有」时记一笔。
+        if (!wasOk) {
+          FileStore.appendLog(filesDir, 'continuous task already applied, treat as ok');
+        }
         return;
       }
       this.keepAliveOk = false;
@@ -246,16 +326,71 @@ export class KeepAliveManager {
   }
 
   /**
-   * 判定 state.json 是否表示「扩展异常销毁、非用户主动停止」。
-   * 双校验缺一不可：userStopped 必须显式为 false，message 必须恰好是「已断开」
-   * （该文案只由 VpnExtAbility.onDestroy 写出；用户主动停止写「未连接」）。
-   * 字段缺失兼容：running/message/userStopped 分别按 false/''/false 处理。
-   * 扩展 writeState() 会带上 userStopped，所以用户主动停止的意图不会被覆盖丢失。
+   * 系统里当前是否真的有 VPN 通道（权威判断，优于 state.json 的 running 文案）。
+   * 与 Index.hasSystemVpn() 同实现：getAllNets + getNetCapabilities + BEARER_VPN。
    */
-  isAbnormalDisconnect(filesDir: string): boolean {
+  async hasSystemVpn(): Promise<boolean> {
+    try {
+      const nets: connection.NetHandle[] = await connection.getAllNets();
+      for (let i = 0; i < nets.length; i++) {
+        const caps: connection.NetCapabilities = await connection.getNetCapabilities(nets[i]);
+        const bearers: connection.NetBearType[] = caps.bearerTypes;
+        if (bearers !== undefined && bearers.indexOf(connection.NetBearType.BEARER_VPN) >= 0) {
+          return true;
+        }
+      }
+    } catch (err) {
+      FileStore.appendLog(this.filesDir, 'hasSystemVpn failed: ' + String(err));
+    }
+    return false;
+  }
+
+  /**
+   * state.json 心跳是否过期。扩展的 statsTimer 每 8s 用 writeText 整文件重写一次
+   * state.json（VpnExtAbility.startStatsLoop，L443-468），所以只要扩展活着，mtime
+   * 最多 8s 就前进一次。扩展被 SIGKILL 时 onDestroy 不会执行，state.json 会永久
+   * 残留 running:true —— 心跳是识别这种「假连接」最可靠的信号。
+   * 阈值 30s（≈3.75 个写入周期），避开偶发 IO 卡顿误判。
+   * ⚠ Stat.mtime 单位是**秒**，必须 ×1000 再与 Date.now()（毫秒）比较。
+   */
+  stateHeartbeatStale(filesDir: string): boolean {
+    const path: string = FileStore.statePath(filesDir);
+    const text: string = FileStore.readText(path);
+    if (text.length === 0 || text.indexOf('"running":true') < 0) {
+      return false;
+    }
+    try {
+      const stat: fileIo.Stat = fileIo.statSync(path);
+      const mtimeMs: number = stat.mtime * 1000;
+      return Date.now() - mtimeMs > HEARTBEAT_STALE_MS;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /**
+   * state.json 是否声称「正在运行」。交叉校验的**前置条件**：只有在系统认为
+   * 应该连着的时候，才允许把「系统里没有 VPN」当成异常去恢复。
+   * 没有这一条，从未连接过的新装应用（running:false / 「未连接」/ userStopped:false）
+   * 会在每次 onForeground 被误判成掉线并自动连上，属于严重误连。
+   */
+  stateSaysRunning(filesDir: string): boolean {
+    const text: string = FileStore.readText(FileStore.statePath(filesDir));
+    return text.indexOf('"running":true') >= 0;
+  }
+
+  /**
+   * 异常来源标签，仅用于日志区分（'' = 无异常）：
+   * - 'abnormal disconnect'：!running && message==='已断开'（扩展走了 onDestroy）
+   * - 'stale heartbeat'：running===true 但 state.json mtime 超 30s 未更新
+   *   （扩展被 SIGKILL，onDestroy 没跑，状态文件停在「已连接」）
+   * 两种情况都要求 userStopped===false——用户主动停止的「未连接」+userStopped=true
+   * 必须一律排除，绝不能被自动抢连回来。
+   */
+  abnormalKind(filesDir: string): string {
     const text: string = FileStore.readText(FileStore.statePath(filesDir));
     if (text.length === 0) {
-      return false;
+      return '';
     }
     let running: boolean = false;
     let message: string = '';
@@ -266,9 +401,26 @@ export class KeepAliveManager {
       message = state.message === undefined ? '' : state.message;
       userStopped = state.userStopped === undefined ? false : state.userStopped;
     } catch (err) {
-      return false;
+      return '';
     }
-    return !running && userStopped === false && message === '已断开';
+    if (userStopped !== false) {
+      return '';
+    }
+    if (!running && message === '已断开') {
+      return 'abnormal disconnect';
+    }
+    if (running && this.stateHeartbeatStale(filesDir)) {
+      return 'stale heartbeat';
+    }
+    return '';
+  }
+
+  /**
+   * 判定 state.json 是否表示「扩展已死、非用户主动停止」。两种来源合入：
+   * 正常断开（running=false + 「已断开」）或心跳过期（running=true 但 mtime 不动）。
+   */
+  isAbnormalDisconnect(filesDir: string): boolean {
+    return this.abnormalKind(filesDir).length > 0;
   }
 
   /**
