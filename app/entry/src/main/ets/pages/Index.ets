@@ -1397,8 +1397,10 @@ struct Index {
     });
     // 订阅返回空、或所有行都解析失败：绝不落盘。
     // 否则 filter 掉整组旧节点后 saveAll 会把该订阅清空并写进磁盘，一次网络抖动就丢节点。
-    // 返回 0（而非 -1）：调用方据此提示「已保留原节点」，同时 selectedKept 不变、不会误触发重连。
+    // 返回 0（而非 -1）：调用方据此提示「已保留原节点」；列表根本没变，显式把 selectedKept 归位为 true，
+    // 避免沿用上一轮的陈旧值让 importSubscription 误触发重连。
     if (added === 0) {
+      this.selectedKept = true;
       return 0;
     }
     this.saveAll(list);
@@ -1478,6 +1480,11 @@ struct Index {
       this.toast.showToast({ message: '订阅内容无法解析（非 base64 也非链接）' });
       return;
     }
+    // 解析出 0 条：applySubContent 已保留旧节点且不落盘，别关抽屉、别误报导入成功、更别重连
+    if (added === 0) {
+      this.toast.showToast({ message: '订阅内容为空，未导入任何节点' });
+      return;
+    }
     this.drawerOpen = false;
     this.toast.showToast({ message: '订阅导入 ' + added + ' 个节点' });
     // 原选中节点原样保留时，当前隧道配置没变，不必断开重连
@@ -1506,9 +1513,14 @@ struct Index {
     }
     const added: number = this.applySubContent(url, body);
     this.statusText = this.running ? '已连接' : '未连接';
-    // added === 0：订阅内容为空（applySubContent 已保留旧节点且不落盘），别再误报「已更新 0 个节点」
-    if (added <= 0) {
-      this.toast.showToast({ message: added === 0 ? '订阅内容为空，已保留原节点' : '订阅内容无法解析' });
+    // -1 是 base64 解码失败、0 是解析出 0 条节点，语义不同，分开提示别混淆
+    if (added < 0) {
+      this.toast.showToast({ message: '订阅内容无法解析' });
+      return;
+    }
+    // added === 0：applySubContent 已保留旧节点且不落盘，别再误报「已更新 0 个节点」
+    if (added === 0) {
+      this.toast.showToast({ message: '订阅内容为空，已保留原节点' });
       return;
     }
     this.toast.showToast({ message: '已更新 ' + added + ' 个节点' });
@@ -1523,6 +1535,10 @@ struct Index {
    * 名称去重留到合并阶段统一做；返回空数组表示这次拉取或解析失败，合并时保留旧节点不动。
    */
   private parseSubNodes(url: string, body: string, idSeed: string): Profile[] {
+    // 拉取失败/空响应直接判定该订阅失败，不必再对空串做一次无意义的 base64 解码
+    if (body.trim().length === 0) {
+      return [];
+    }
     let content: string = body;
     if (!content.includes('://')) {
       try {
@@ -1658,12 +1674,19 @@ struct Index {
 
       // 一次落盘：没有任何订阅成功时绝不写盘
       if (okSubs > 0) {
+        // 前置计算：先只针对临时数组 list 找回身份并定好 selected，再调 saveAll。
+        // saveAll 内部的 bump → refreshRows 会用当时的 selected 生成行 key 与 row.selected；
+        // 若放到 saveAll 之后才赋值，选中高亮会停在钳制后的旧下标，直到下次刷新才纠正。
+        // 这段同步代码中间没有 await，this.profiles 短暂仍是旧数组也不会触发 UI 刷新。
+        let hit: number = -1;
+        if (prev !== undefined) {
+          hit = this.findProfileByIdentity(list, prev);
+          this.selected = hit >= 0 ? hit : 0;
+        }
         this.saveAll(list);
-        // 一次身份找回 + 一次重连判定，语义与 applySubContent 一致：
+        // 一次重连判定，语义与 applySubContent 一致：
         // 仅 server+port 或 name 命中说明凭据变了，仍需重连
         if (prev !== undefined) {
-          const hit: number = this.findProfileByIdentity(list, prev);
-          this.selected = hit >= 0 ? hit : 0;
           let kept: boolean = false;
           if (hit >= 0) {
             const cur: Profile = list[hit];
@@ -1675,6 +1698,10 @@ struct Index {
             this.reconnectSoon();
           }
         }
+      } else {
+        // 全部失败：列表根本没变，selectedKept 归位为 true（= 原选中节点原样保留、不必重连），
+        // 否则残留的 false 会让后续操作误触发一次重连
+        this.selectedKept = true;
       }
 
       // 全程只弹一个汇总 toast，互斥提示不在此路径内
@@ -1683,7 +1710,9 @@ struct Index {
       if (okSubs === 0) {
         msg = '订阅更新失败，已保留原有节点 (' + String(bad) + ' 个失败/跳过)';
       } else {
-        msg = '已更新 ' + String(okSubs) + '/' + String(this.updTotal) + ' 个订阅 · 共 ' +
+        // 分母用 allUrls.length（含被跳过的明文 http 订阅），避免「3/3 个订阅 (2 个失败/跳过)」
+        // 这种自相矛盾的文案；进度卡 updTotal 仍只反映实际发起的请求数 targets.length。
+        msg = '已更新 ' + String(okSubs) + '/' + String(allUrls.length) + ' 个订阅 · 共 ' +
           String(addedTotal) + ' 个节点';
         if (bad > 0) {
           msg += ' (' + String(bad) + ' 个失败/跳过)';
@@ -1704,6 +1733,10 @@ struct Index {
 
   /** 单个分组测速：只测这一组的节点。 */
   async testGroup(group: NodeGroup): Promise<void> {
+    if (this.updatingAll) {
+      this.toast.showToast({ message: '正在全部更新，稍后再测速' });
+      return;
+    }
     if (!this.running) {
       this.toast.showToast({ message: '请先连接，内核起来后才能测速' });
       return;
