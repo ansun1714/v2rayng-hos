@@ -351,6 +351,26 @@ struct Index {
   @State eAlpn: string = '';
   @State eInsecure: boolean = false;
   @State eFingerprint: string = '';
+  // 高级传输 / 协议字段（手动新建/编辑入口）
+  @State eFlow: string = '';
+  @State eGrpcService: string = '';
+  @State eRealityPbk: string = '';
+  @State eRealitySid: string = '';
+  @State eAlterId: string = '0';
+  @State eKcpSeed: string = '';
+  @State eKcpHeader: string = '';
+  @State eXhttpMode: string = '';
+  @State eHttpUpgrade: boolean = false;
+  @State eHttpUpgradeFastOpen: boolean = false;
+  @State eHy2Obfs: string = '';
+  @State eHy2ObfsPassword: string = '';
+  @State eHy2Up: string = '';
+  @State eHy2Down: string = '';
+  @State eTuicCongestion: string = '';
+  @State eTuicUdpMode: string = '';
+  @State eTuicReduceRtt: boolean = false;
+  @State eTuicFastOpen: boolean = false;
+  @State eAnytlsMetadata: string = '';
 
   // 测速偏好（并发 / 包大小）与内核版本
   @State settingsPanel: boolean = false;
@@ -2893,6 +2913,27 @@ struct Index {
     this.eAlpn = p.alpn;
     this.eInsecure = p.allowInsecure === true;
     this.eFingerprint = p.fingerprint;
+    this.eFlow = p.flow;
+    this.eGrpcService = p.grpcService;
+    this.eRealityPbk = p.realityPbk;
+    this.eRealitySid = p.realitySid;
+    this.eAlterId = String(p.alterId);
+    this.eKcpSeed = p.kcpSeed;
+    this.eKcpHeader = p.kcpHeader;
+    this.eXhttpMode = p.xhttpMode;
+    this.eHttpUpgrade = p.httpUpgrade === true;
+    this.eHttpUpgradeFastOpen = p.httpUpgradeFastOpen === true;
+    this.eHy2Obfs = p.hy2Obfs;
+    this.eHy2ObfsPassword = p.hy2ObfsPassword;
+    this.eHy2Up = p.hy2Up;
+    this.eHy2Down = p.hy2Down;
+    this.eTuicCongestion = p.tuicCongestion;
+    this.eTuicUdpMode = p.tuicUdpMode;
+    this.eTuicReduceRtt = p.tuicReduceRtt === true;
+    this.eTuicFastOpen = p.tuicFastOpen === true;
+    this.eAnytlsMetadata = p.anytlsMetadata;
+    // httpupgrade 在模型里是 ws + 布尔标志，编辑器里单独成一个传输选项展示。
+    this.eNetwork = p.httpUpgrade ? 'httpupgrade' : p.network;
   }
 
   addNew(): void {
@@ -2914,6 +2955,25 @@ struct Index {
     this.eAlpn = '';
     this.eInsecure = false;
     this.eFingerprint = '';
+    this.eFlow = '';
+    this.eGrpcService = '';
+    this.eRealityPbk = '';
+    this.eRealitySid = '';
+    this.eAlterId = '0';
+    this.eKcpSeed = '';
+    this.eKcpHeader = '';
+    this.eXhttpMode = '';
+    this.eHttpUpgrade = false;
+    this.eHttpUpgradeFastOpen = false;
+    this.eHy2Obfs = '';
+    this.eHy2ObfsPassword = '';
+    this.eHy2Up = '';
+    this.eHy2Down = '';
+    this.eTuicCongestion = '';
+    this.eTuicUdpMode = '';
+    this.eTuicReduceRtt = false;
+    this.eTuicFastOpen = false;
+    this.eAnytlsMetadata = '';
   }
 
   closeEdit(): void {
@@ -2949,7 +3009,6 @@ struct Index {
     p.username = this.eUsername.trim();
     p.password = this.ePassword;
     p.cipher = this.eCipher.trim();
-    p.network = this.eNetwork;
     p.tls = this.eTls;
     p.sni = this.eSni.trim();
     p.wsPath = this.ePath;
@@ -2957,6 +3016,34 @@ struct Index {
     p.alpn = this.eAlpn.trim();
     p.allowInsecure = this.eInsecure;
     p.fingerprint = this.eFingerprint;
+    p.flow = this.eFlow.trim();
+    p.grpcService = this.eGrpcService.trim();
+    p.realityPbk = this.eRealityPbk.trim();
+    p.realitySid = this.eRealitySid.trim();
+    const aid: number = Number.parseInt(this.eAlterId);
+    p.alterId = Number.isNaN(aid) ? 0 : aid;
+    p.kcpSeed = this.eKcpSeed.trim();
+    p.kcpHeader = this.eKcpHeader.trim();
+    p.xhttpMode = this.eXhttpMode.trim();
+    p.hy2Obfs = this.eHy2Obfs.trim();
+    p.hy2ObfsPassword = this.eHy2ObfsPassword.trim();
+    p.hy2Up = this.eHy2Up.trim();
+    p.hy2Down = this.eHy2Down.trim();
+    p.tuicCongestion = this.eTuicCongestion.trim();
+    p.tuicUdpMode = this.eTuicUdpMode.trim();
+    p.tuicReduceRtt = this.eTuicReduceRtt;
+    p.tuicFastOpen = this.eTuicFastOpen;
+    p.anytlsMetadata = this.eAnytlsMetadata.trim();
+    // httpupgrade 在模型里是 ws + v2ray-http-upgrade 布尔；编辑器单独成项。
+    if (this.eNetwork === 'httpupgrade') {
+      p.network = 'ws';
+      p.httpUpgrade = true;
+      p.httpUpgradeFastOpen = this.eHttpUpgradeFastOpen;
+    } else {
+      p.network = this.eNetwork;
+      p.httpUpgrade = false;
+      p.httpUpgradeFastOpen = false;
+    }
     p.link = ProxyLink.toLink(p);
     p.delay = -1;
     const wanted: string = this.eName.trim().length > 0 ? this.eName.trim() : (p.server + ':' + p.port);
@@ -4205,6 +4292,9 @@ struct Index {
               this.chip('vmess', this.eType, () => { this.eType = 'vmess'; })
               this.chip('trojan', this.eType, () => { this.eType = 'trojan'; })
               this.chip('ss', this.eType, () => { this.eType = 'ss'; })
+              this.chip('hysteria2', this.eType, () => { this.eType = 'hysteria2'; })
+              this.chip('tuic', this.eType, () => { this.eType = 'tuic'; })
+              this.chip('anytls', this.eType, () => { this.eType = 'anytls'; })
               this.chip('socks5', this.eType, () => { this.eType = 'socks5'; })
               this.chip('http', this.eType, () => { this.eType = 'http'; })
             }.layoutWeight(1)
@@ -4212,18 +4302,48 @@ struct Index {
 
           this.field('服务器', this.eServer, (v: string) => { this.eServer = v; })
           this.field('端口', this.ePort, (v: string) => { this.ePort = v; })
-          if (this.eType === 'vless' || this.eType === 'vmess') {
+          if (this.eType === 'vless' || this.eType === 'vmess' || this.eType === 'tuic') {
             this.field('UUID', this.eUuid, (v: string) => { this.eUuid = v; })
           }
-          if (this.eType === 'trojan' || this.eType === 'ss') {
-            this.field('密码', this.ePassword, (v: string) => { this.ePassword = v; })
+          if (this.eType === 'vmess') {
+            this.field('alterId', this.eAlterId, (v: string) => { this.eAlterId = v; })
           }
-          if (this.eType === 'ss') {
+          if (this.eType === 'vmess' || this.eType === 'ss') {
             this.field('加密方式', this.eCipher, (v: string) => { this.eCipher = v; })
+          }
+          if (this.eType === 'trojan' || this.eType === 'ss' || this.eType === 'hysteria2'
+            || this.eType === 'tuic' || this.eType === 'anytls'
+            || this.eType === 'socks5' || this.eType === 'http') {
+            this.field('密码', this.ePassword, (v: string) => { this.ePassword = v; })
           }
           if (this.eType === 'socks5' || this.eType === 'http') {
             this.field('用户名', this.eUsername, (v: string) => { this.eUsername = v; })
-            this.field('密码', this.ePassword, (v: string) => { this.ePassword = v; })
+          }
+          if (this.eType === 'vless') {
+            this.field('flow', this.eFlow, (v: string) => { this.eFlow = v; })
+          }
+          if (this.eType === 'hysteria2') {
+            this.field('上行带宽', this.eHy2Up, (v: string) => { this.eHy2Up = v; })
+            this.field('下行带宽', this.eHy2Down, (v: string) => { this.eHy2Down = v; })
+            this.field('混淆类型', this.eHy2Obfs, (v: string) => { this.eHy2Obfs = v; })
+            this.field('混淆密码', this.eHy2ObfsPassword, (v: string) => { this.eHy2ObfsPassword = v; })
+          }
+          if (this.eType === 'tuic') {
+            this.field('拥塞控制', this.eTuicCongestion, (v: string) => { this.eTuicCongestion = v; })
+            this.field('UDP 中继', this.eTuicUdpMode, (v: string) => { this.eTuicUdpMode = v; })
+            Row({ space: 8 }) {
+              Text('reduce-rtt').fontSize(15).width(80).fontColor('#4A4A4A')
+              Toggle({ type: ToggleType.Switch, isOn: this.eTuicReduceRtt })
+                .onChange((on: boolean) => { this.eTuicReduceRtt = on; })
+            }.width('100%')
+            Row({ space: 8 }) {
+              Text('fast-open').fontSize(15).width(80).fontColor('#4A4A4A')
+              Toggle({ type: ToggleType.Switch, isOn: this.eTuicFastOpen })
+                .onChange((on: boolean) => { this.eTuicFastOpen = on; })
+            }.width('100%')
+          }
+          if (this.eType === 'anytls') {
+            this.field('client-metadata', this.eAnytlsMetadata, (v: string) => { this.eAnytlsMetadata = v; })
           }
 
           Row({ space: 8 }) {
@@ -4232,6 +4352,11 @@ struct Index {
               this.chip('tcp', this.eNetwork, () => { this.eNetwork = 'tcp'; })
               this.chip('ws', this.eNetwork, () => { this.eNetwork = 'ws'; })
               this.chip('grpc', this.eNetwork, () => { this.eNetwork = 'grpc'; })
+              this.chip('h2', this.eNetwork, () => { this.eNetwork = 'h2'; })
+              this.chip('kcp', this.eNetwork, () => { this.eNetwork = 'kcp'; })
+              this.chip('http', this.eNetwork, () => { this.eNetwork = 'http'; })
+              this.chip('xhttp', this.eNetwork, () => { this.eNetwork = 'xhttp'; })
+              this.chip('httpupgrade', this.eNetwork, () => { this.eNetwork = 'httpupgrade'; })
             }.layoutWeight(1)
           }.width('100%')
 
@@ -4266,10 +4391,37 @@ struct Index {
                   this.eInsecure = on;
                 })
             }.width('100%')
+            if (this.eType === 'vless') {
+              this.field('REALITY 公钥', this.eRealityPbk, (v: string) => { this.eRealityPbk = v; })
+              this.field('REALITY short-id', this.eRealitySid, (v: string) => { this.eRealitySid = v; })
+            }
           }
-          if (this.eNetwork === 'ws') {
-            this.field('WS 路径', this.ePath, (v: string) => { this.ePath = v; })
-            this.field('WS Host', this.eHost, (v: string) => { this.eHost = v; })
+          if (this.eNetwork === 'grpc') {
+            this.field('gRPC 服务名', this.eGrpcService, (v: string) => { this.eGrpcService = v; })
+          }
+          if (this.eNetwork === 'kcp') {
+            this.field('mKCP seed', this.eKcpSeed, (v: string) => { this.eKcpSeed = v; })
+            this.field('mKCP 伪装头', this.eKcpHeader, (v: string) => { this.eKcpHeader = v; })
+          }
+          if (this.eNetwork === 'xhttp') {
+            this.field('路径', this.ePath, (v: string) => { this.ePath = v; })
+            this.field('Host', this.eHost, (v: string) => { this.eHost = v; })
+            this.field('xhttp 模式', this.eXhttpMode, (v: string) => { this.eXhttpMode = v; })
+          }
+          if (this.eNetwork === 'http' || this.eNetwork === 'h2') {
+            this.field('路径', this.ePath, (v: string) => { this.ePath = v; })
+            this.field('Host', this.eHost, (v: string) => { this.eHost = v; })
+          }
+          if (this.eNetwork === 'ws' || this.eNetwork === 'httpupgrade') {
+            this.field('路径', this.ePath, (v: string) => { this.ePath = v; })
+            this.field('Host', this.eHost, (v: string) => { this.eHost = v; })
+          }
+          if (this.eNetwork === 'httpupgrade') {
+            Row({ space: 8 }) {
+              Text('fast-open').fontSize(15).width(80).fontColor('#4A4A4A')
+              Toggle({ type: ToggleType.Switch, isOn: this.eHttpUpgradeFastOpen })
+                .onChange((on: boolean) => { this.eHttpUpgradeFastOpen = on; })
+            }.width('100%')
           }
         }.width('100%')
       }
