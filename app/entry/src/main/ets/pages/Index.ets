@@ -47,6 +47,11 @@ const SPEED_PROBES: string[] = [
   'https://proof.ovh.net/files/1Mb.dat'
 ];
 
+// Geo 资源默认更新源（MetaCubeX meta-rules-dat 最新 release）。下载走直连 https，
+// 若本机网络访问 GitHub 受限，可在 Geo 管理页改用本地文件替换。
+const GEOIP_URL: string = 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat';
+const GEOSITE_URL: string = 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat';
+
 interface ExitGeo {
   ip?: string;
   country?: string;
@@ -369,6 +374,13 @@ struct Index {
   @State groupPanel: boolean = false;
   @State gName: string = '';
   @State gUrl: string = '';
+
+  // Geo 资源管理页：geoip.dat / geosite.dat 大小与修改时间文案、忙碌标志
+  @State geoPanel: boolean = false;
+  @State geoMsg: string = '';
+  @State geoBusy: boolean = false;
+  @State geoIpText: string = '';
+  @State geoSiteText: string = '';
 
   private filesDir: string = '';
   private pollTimer: number = -1;
@@ -3468,6 +3480,175 @@ struct Index {
       pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
   }
 
+  // ---------- Geo 资源管理（B5） ----------
+
+  openGeo(): void {
+    this.geoPanel = true;
+    this.drawerOpen = false;
+    this.refreshGeoInfo();
+  }
+
+  private geoPath(which: string): string {
+    return FileStore.ensureDir(this.filesDir) + '/' + which + '.dat';
+  }
+
+  private static formatGeoSize(bytes: number): string {
+    if (bytes <= 0) {
+      return '未找到';
+    }
+    if (bytes >= 1048576) {
+      return (bytes / 1048576).toFixed(1) + ' MB';
+    }
+    return Math.round(bytes / 1024) + ' KB';
+  }
+
+  private refreshGeoInfo(): void {
+    this.geoIpText = Index.geoStatText(this.geoPath('geoip'));
+    this.geoSiteText = Index.geoStatText(this.geoPath('geosite'));
+  }
+
+  private static geoStatText(path: string): string {
+    try {
+      const stat = fileIo.statSync(path);
+      // Stat.mtime 单位是秒（与看门狗/保活模块一致），×1000 再交给 Date 当毫秒解析
+      const d: Date = new Date(stat.mtime * 1000);
+      const pad = (n: number): string => n < 10 ? '0' + String(n) : String(n);
+      const t: string = String(d.getFullYear()) + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+        ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+      return Index.formatGeoSize(stat.size) + ' · ' + t;
+    } catch (err) {
+      return '未找到';
+    }
+  }
+
+  private async httpGetArrayBuffer(url: string, timeoutMs: number): Promise<ArrayBuffer | null> {
+    if (!url.toLowerCase().startsWith('https://')) {
+      return null;
+    }
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: timeoutMs,
+        readTimeout: timeoutMs,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        header: { 'User-Agent': 'V2rayM-harmony/1.0' }
+      });
+      if (resp.responseCode !== 200) {
+        FileStore.appendLog(this.filesDir, 'geo download non-200: ' + String(resp.responseCode));
+        return null;
+      }
+      const raw: ArrayBuffer = resp.result as ArrayBuffer;
+      if (raw === undefined || raw === null || raw.byteLength === 0) {
+        return null;
+      }
+      return raw;
+    } catch (err) {
+      const be = err as BusinessError;
+      FileStore.appendLog(this.filesDir, 'geo download err: code=' +
+        String(be.code !== undefined ? be.code : -1) + ' msg=' + String(be.message));
+      return null;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  private writeGeoBytes(which: string, data: ArrayBuffer): void {
+    const target: string = this.geoPath(which);
+    const file = fileIo.openSync(target,
+      fileIo.OpenMode.CREATE | fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.TRUNC);
+    fileIo.writeSync(file.fd, data);
+    fileIo.closeSync(file);
+    // 元数据落盘有短暂延迟，先刷一次、300ms 后再刷一次，避免面板时间停留在旧值
+    this.refreshGeoInfo();
+    setTimeout(() => { this.refreshGeoInfo(); }, 300);
+  }
+
+  async downloadGeo(which: string): Promise<void> {
+    if (this.geoBusy) {
+      return;
+    }
+    const url: string = which === 'geoip' ? GEOIP_URL : GEOSITE_URL;
+    this.geoBusy = true;
+    this.geoMsg = '正在下载 ' + which + '.dat …';
+    try {
+      const buf: ArrayBuffer | null = await this.httpGetArrayBuffer(url, 60000);
+      if (buf === null) {
+        this.geoMsg = '下载失败：网络不可达或返回非 200，可改用本地文件替换';
+        this.toast.showToast({ message: '下载失败' });
+        return;
+      }
+      this.writeGeoBytes(which, buf);
+      this.refreshGeoInfo();
+      this.geoMsg = '已更新 ' + which + '.dat（' + Index.formatGeoSize(buf.byteLength) + '），重连后生效';
+      this.reconnectSoon();
+      this.toast.showToast({ message: '已更新 Geo 资源' });
+    } finally {
+      this.geoBusy = false;
+    }
+  }
+
+  async replaceGeoFromFile(which: string): Promise<void> {
+    if (this.geoBusy) {
+      return;
+    }
+    try {
+      const context = this.getUIContext().getHostContext() as common.Context;
+      const doc = new picker.DocumentViewPicker(context);
+      const options = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      const uris: string[] = await doc.select(options);
+      if (uris.length === 0) {
+        return;
+      }
+      const buf: ArrayBuffer | null = Index.readUriBytes(uris[0]);
+      if (buf === null || buf.byteLength === 0) {
+        this.geoMsg = '读取文件失败';
+        this.toast.showToast({ message: '读取文件失败' });
+        return;
+      }
+      this.writeGeoBytes(which, buf);
+      this.refreshGeoInfo();
+      this.geoMsg = '已从本地文件替换 ' + which + '.dat，重连后生效';
+      this.reconnectSoon();
+      this.toast.showToast({ message: '已替换 Geo 资源' });
+    } catch (err) {
+      this.geoMsg = '替换失败：' + String(err);
+      this.toast.showToast({ message: '替换失败' });
+    }
+  }
+
+  restoreBuiltinGeo(which: string): void {
+    if (this.geoBusy) {
+      return;
+    }
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const raw: Uint8Array = context.resourceManager.getRawFileContentSync(which + '.dat');
+      const buf: ArrayBuffer = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+      this.writeGeoBytes(which, buf);
+      this.refreshGeoInfo();
+      this.geoMsg = '已恢复内置 ' + which + '.dat，重连后生效';
+      this.reconnectSoon();
+      this.toast.showToast({ message: '已恢复内置资源' });
+    } catch (err) {
+      this.geoMsg = '恢复内置失败：' + String(err);
+    }
+  }
+
+  static readUriBytes(uri: string): ArrayBuffer | null {
+    try {
+      const file = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+      const stat = fileIo.statSync(uri);
+      const buffer = new ArrayBuffer(stat.size);
+      fileIo.readSync(file.fd, buffer);
+      fileIo.closeSync(file);
+      return buffer;
+    } catch (err) {
+      return null;
+    }
+  }
+
   /** 地址栏回车也触发更新，键盘遮挡时少一步 */
   async importRulesFromUrl(): Promise<void> {
     let url: string = this.ruleUrl.trim();
@@ -4270,6 +4451,16 @@ struct Index {
             this.openRules();
           })
 
+        Button('设置 · Geo 资源')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.openGeo();
+          })
+
         Button('新建分组')
           .width('100%')
           .height(44)
@@ -4450,6 +4641,66 @@ struct Index {
       Text('改动后需要重新连接代理才会生效。模式为「全部走代理」时名单不生效。')
         .fontSize(12)
         .fontColor('#B26A00')
+
+      Blank()
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+    .backgroundColor('#FFFFFF')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  geoBlock(which: string, label: string, info: string) {
+    Column({ space: 8 }) {
+      Row() {
+        Text(label).fontSize(15).fontWeight(FontWeight.Medium).layoutWeight(1)
+        Text(info).fontSize(12).fontColor('#5A5A5A')
+      }.width('100%')
+      Row({ space: 8 }) {
+        Button('在线更新')
+          .layoutWeight(1).height(38).fontSize(13)
+          .backgroundColor('#F0F0F0').fontColor('#333333')
+          .enabled(!this.geoBusy)
+          .onClick(() => { this.downloadGeo(which); })
+        Button('本地替换')
+          .layoutWeight(1).height(38).fontSize(13)
+          .backgroundColor('#F0F0F0').fontColor('#333333')
+          .enabled(!this.geoBusy)
+          .onClick(() => { this.replaceGeoFromFile(which); })
+        Button('恢复内置')
+          .layoutWeight(1).height(38).fontSize(13)
+          .backgroundColor('#F0F0F0').fontColor('#333333')
+          .enabled(!this.geoBusy)
+          .onClick(() => { this.restoreBuiltinGeo(which); })
+      }.width('100%')
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor('#F7F7F7')
+    .borderRadius(12)
+  }
+
+  @Builder
+  geoPanelView() {
+    Column({ space: 12 }) {
+      Row({ space: 8 }) {
+        Button('返回')
+          .width(76).height(38).fontSize(14)
+          .backgroundColor('#F0F0F0').fontColor('#333333')
+          .onClick(() => { this.geoPanel = false; })
+        Text('Geo 资源').fontSize(19).fontWeight(FontWeight.Bold).layoutWeight(1)
+      }.width('100%')
+
+      Text('geoip.dat（IP 库）/ geosite.dat（域名库）由内核启动时读取；在线更新走默认源，' +
+        '若本机网络访问受限，可用本地 .dat 文件替换。替换后会自动重连生效。')
+        .fontSize(13).fontColor('#5A5A5A')
+
+      this.geoBlock('geoip', 'geoip.dat · IP 库', this.geoIpText)
+      this.geoBlock('geosite', 'geosite.dat · 域名库', this.geoSiteText)
+
+      Text(this.geoMsg).fontSize(13).fontColor('#B26A00')
 
       Blank()
     }
@@ -5400,6 +5651,10 @@ struct Index {
 
       if (this.settingsPanel) {
         this.settingsPanelView()
+      }
+
+      if (this.geoPanel) {
+        this.geoPanelView()
       }
 
       if (this.rulePanel && this.ruleEditing >= 0) {
