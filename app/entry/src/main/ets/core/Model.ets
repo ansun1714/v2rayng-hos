@@ -74,6 +74,8 @@ export interface AppSettings {
   failover: boolean;
   /** 连接期间是否申请后台长时任务保活（开关，默认开） */
   keepAlive: boolean;
+  /** 应用启动时是否静默更新所有带链接的订阅分组（开关，默认关） */
+  autoUpdateOnStart: boolean;
 }
 
 /** 订阅分组配额：解析自响应头 subscription-userinfo（upload/download/total/expire）。 */
@@ -89,6 +91,25 @@ export interface SubQuota {
 export interface FetchResult {
   body: string;
   headers: Map<string, string>;
+}
+
+/**
+ * 全量备份载荷：节点、分组名、配额、规则、分应用名单、测速偏好与规则源地址。
+ * 导出为 JSON 文件换机还原；selected 存选中节点身份（server/port/uuid/name），
+ * 还原后按身份重新定位下标，避免顺序变化导致选错节点。
+ */
+export interface BackupPayload {
+  version: number;
+  app: string;
+  createdAt: number;
+  profiles: Profile[];
+  groupNames: Record<string, string>;
+  subQuota: Record<string, SubQuota>;
+  rules: RuleItem[];
+  appScope: AppScope;
+  settings: AppSettings;
+  rulesSrc: string;
+  selected: Profile | null;
 }
 
 export class CoreState {

@@ -6,7 +6,7 @@ import { vpnExtension, http, connection } from '@kit.NetworkKit';
 import { PromptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { ProxyLink } from '../core/ProxyLink';
-import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope, AppSettings, SubQuota, FetchResult } from '../core/Model';
+import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope, AppSettings, SubQuota, FetchResult, BackupPayload } from '../core/Model';
 import { ConfigBuilder } from '../core/ConfigBuilder';
 import { FileStore } from '../core/FileStore';
 import { KeepAliveManager } from '../core/KeepAliveManager';
@@ -108,6 +108,7 @@ interface SettingsPatch {
   autoConnect?: boolean;
   failover?: boolean;
   keepAlive?: boolean;
+  autoUpdateOnStart?: boolean;
 }
 
 /**
@@ -303,6 +304,9 @@ struct Index {
   @State rTarget: string = 'DIRECT';
   @State ruleUrl: string = '';
   @State ruleMsg: string = '';
+  /** 路由快捷清单：直连 / 强制代理域名输入框 */
+  @State directDomInput: string = '';
+  @State proxyDomInput: string = '';
   /** 规则列表一次渲染多少条：社区规则集动辄几千条，分页渲染避免列表卡死。 */
   @State rulesLimit: number = 50;
 
@@ -334,7 +338,7 @@ struct Index {
   @State settingsPanel: boolean = false;
   @State settings: AppSettings = {
     testConcurrency: 24, speedBytes: 5242880,
-    autoConnect: true, failover: true, keepAlive: true
+    autoConnect: true, failover: true, keepAlive: true, autoUpdateOnStart: false
   };
   @State coreVersion: string = '';
 
@@ -420,6 +424,12 @@ struct Index {
     this.refreshRows();
     if (this.profiles.length === 0) {
       this.seedDefaultNodes();
+    }
+    // 启动自动更新：开关打开且已有节点时，延迟一拍等首帧渲染后静默拉取全部订阅
+    if (this.settings.autoUpdateOnStart && this.profiles.length > 0) {
+      setTimeout(() => {
+        this.updateAllSubscriptions();
+      }, 600);
     }
     const pending: string = AppStorage.get<string>('launchImportUri') ?? '';
     if (pending.length > 0) {
@@ -2190,7 +2200,7 @@ struct Index {
     }
     this.statusText = '正在拉取订阅…';
     const fetched: FetchResult =
-      await this.httpGetRaw(url, 15000);
+      await this.httpGetRaw(url, 60000);
     const body: string = fetched.body;
     // 拉取期间可能开始了「全部更新」：已飞行的这次导入不能再 applySubContent，
     // 否则会在批量合并阶段多写一次盘并可能多触发一次重连。同时恢复上面设的进度文案。
@@ -2243,7 +2253,7 @@ struct Index {
     }
     this.statusText = '正在更新订阅…';
     const fetched: FetchResult =
-      await this.httpGetRaw(url, 15000);
+      await this.httpGetRaw(url, 60000);
     const body: string = fetched.body;
     // 拉取期间可能开始了「全部更新」：已飞行的单组更新必须与批量合并互斥，
     // 否则会多写一次盘并可能多触发一次重连。同时恢复上面设的进度文案。
@@ -2380,12 +2390,12 @@ struct Index {
           }
           const url: string = targets[at];
           // 单请求超时：给每个 URL 一个确定上界，httpGet 的 promise 永不 settle 时
-          // 16s 后返回 '' 判为该订阅失败，worker 继续推进，Promise.all 与 finally 必然执行。
+          // 61s 后返回 '' 判为该订阅失败，worker 继续推进，Promise.all 与 finally 必然执行。
           // 不用整体 race（超时后 worker 仍在飞行会游离写 bodies/updDone），也不加看门狗定时器。
           const timeout: Promise<FetchResult> =
-            Index.sleep(16000).then((): FetchResult => emptyRaw);
+            Index.sleep(61000).then((): FetchResult => emptyRaw);
           const fetched: FetchResult =
-            await Promise.race([this.httpGetRaw(url, 15000), timeout]);
+            await Promise.race([this.httpGetRaw(url, 60000), timeout]);
           bodies.set(url, fetched.body);
           quotaHeaders.set(url, fetched.headers);
           this.updDone = this.updDone + 1;
@@ -2944,7 +2954,8 @@ struct Index {
       String(this.settings.testConcurrency) + ' speedBytes=' + String(this.settings.speedBytes) +
       ' autoConnect=' + String(this.settings.autoConnect) +
       ' failover=' + String(this.settings.failover) +
-      ' keepAlive=' + String(this.settings.keepAlive));
+      ' keepAlive=' + String(this.settings.keepAlive) +
+      ' autoUpdateOnStart=' + String(this.settings.autoUpdateOnStart));
     // 保活被关掉：释放已申请的长时任务；重新打开后下次连接边沿会再次申请
     if (!this.settings.keepAlive) {
       this.releaseKeepAlive();
@@ -2959,7 +2970,8 @@ struct Index {
       speedBytes: patch.speedBytes !== undefined ? patch.speedBytes : this.settings.speedBytes,
       autoConnect: patch.autoConnect !== undefined ? patch.autoConnect : this.settings.autoConnect,
       failover: patch.failover !== undefined ? patch.failover : this.settings.failover,
-      keepAlive: patch.keepAlive !== undefined ? patch.keepAlive : this.settings.keepAlive
+      keepAlive: patch.keepAlive !== undefined ? patch.keepAlive : this.settings.keepAlive,
+      autoUpdateOnStart: patch.autoUpdateOnStart !== undefined ? patch.autoUpdateOnStart : this.settings.autoUpdateOnStart
     };
   }
 
@@ -3045,6 +3057,115 @@ struct Index {
     const list: RuleItem[] = this.rules.slice();
     list.splice(index, 1);
     this.rules = list;
+  }
+
+  // ---------- 路由快捷开关与域名清单 ----------
+
+  private ruleIndexById(id: string): number {
+    for (let i = 0; i < this.rules.length; i++) {
+      if (this.rules[i].id === id) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private setRuleEnabled(id: string, on: boolean): void {
+    const idx: number = this.ruleIndexById(id);
+    if (idx < 0) {
+      return;
+    }
+    const r: RuleItem = this.rules[idx];
+    this.replaceRule(idx, {
+      id: r.id, title: r.title, kind: r.kind, value: r.value, target: r.target, enabled: on
+    });
+  }
+
+  /** 绕过中国大陆：内置「中国域名 + 中国 IP」两条直连规则同时启用视为开。 */
+  private bypassCnOn(): boolean {
+    const a: number = this.ruleIndexById('r_cn_site');
+    const b: number = this.ruleIndexById('r_cn_ip');
+    return a >= 0 && b >= 0 && this.rules[a].enabled && this.rules[b].enabled;
+  }
+
+  private toggleBypassCn(on: boolean): void {
+    this.setRuleEnabled('r_cn_site', on);
+    this.setRuleEnabled('r_cn_ip', on);
+    this.persistRules();
+  }
+
+  /** 广告拦截规则缺失时补一条 category-ads-all 走 REJECT，返回其下标。 */
+  private ensureAdRule(): number {
+    let idx: number = this.ruleIndexById('r_ads');
+    if (idx >= 0) {
+      return idx;
+    }
+    const rule: RuleItem = {
+      id: 'r_ads', title: '拦截广告域名', kind: 'GEOSITE',
+      value: 'category-ads-all', target: 'REJECT', enabled: true
+    };
+    const list: RuleItem[] = this.rules.slice();
+    list.splice(1, 0, rule);
+    this.rules = list;
+    return this.ruleIndexById('r_ads');
+  }
+
+  private blockAdsOn(): boolean {
+    const idx: number = this.ruleIndexById('r_ads');
+    return idx >= 0 && this.rules[idx].enabled;
+  }
+
+  private toggleBlockAds(on: boolean): void {
+    if (on) {
+      this.ensureAdRule();
+    }
+    this.setRuleEnabled('r_ads', on);
+    this.persistRules();
+  }
+
+  private persistRules(): void {
+    FileStore.saveRules(this.filesDir, this.rules);
+    this.reconnectSoon();
+  }
+
+  private domainRules(prefix: string): RuleItem[] {
+    return this.rules.filter((r: RuleItem) => r.id.startsWith(prefix));
+  }
+
+  private normalizeDomain(raw: string): string {
+    let v: string = raw.trim().toLowerCase();
+    v = v.replace(/^https?:\/\//, '');
+    v = v.split('/')[0];
+    v = v.replace(/^[.\s]+/, '');
+    return ConfigBuilder.safeValue('DOMAIN-SUFFIX', v);
+  }
+
+  private addDomainToList(prefix: string, target: string, label: string, input: string): void {
+    const value: string = this.normalizeDomain(input);
+    if (value.length === 0) {
+      this.toast.showToast({ message: '请填写域名，例如 example.com' });
+      return;
+    }
+    const dup: boolean = this.rules.some((r: RuleItem) => r.id.startsWith(prefix) && r.value === value);
+    if (dup) {
+      this.toast.showToast({ message: '该域名已在清单中' });
+      return;
+    }
+    const rule: RuleItem = {
+      id: prefix + value, title: label + ' ' + value, kind: 'DOMAIN-SUFFIX',
+      value: value, target: target, enabled: true
+    };
+    const list: RuleItem[] = this.rules.slice();
+    list.push(rule);
+    this.rules = list;
+    this.persistRules();
+  }
+
+  private removeDomainFromList(prefix: string, value: string): void {
+    const list: RuleItem[] = this.rules.filter(
+      (r: RuleItem) => !(r.id.startsWith(prefix) && r.value === value));
+    this.rules = list;
+    this.persistRules();
   }
 
   openRuleEdit(index: number): void {
@@ -3149,6 +3270,202 @@ struct Index {
       this.ruleMsg = '文件导入失败：' + String(err);
       this.toast.showToast({ message: '文件导入失败：' + String(err) });
     }
+  }
+
+  // ---------- 全量备份 / 还原 ----------
+
+  /** 汇总当前全部本机配置为备份载荷。 */
+  private buildBackupPayload(): BackupPayload {
+    const groupNames: Record<string, string> = {};
+    this.groupNames.forEach((name: string, key: string) => {
+      groupNames[key] = name;
+    });
+    const subQuota: Record<string, SubQuota> = {};
+    this.subQuota.forEach((quota: SubQuota, key: string) => {
+      subQuota[key] = quota;
+    });
+    const selected: Profile | null =
+      this.selected >= 0 && this.selected < this.profiles.length ? this.profiles[this.selected] : null;
+    return {
+      version: 1,
+      app: 'V2rayM',
+      createdAt: Date.now(),
+      profiles: this.profiles,
+      groupNames: groupNames,
+      subQuota: subQuota,
+      rules: this.rules,
+      appScope: FileStore.loadAppScope(this.filesDir),
+      settings: this.settings,
+      rulesSrc: this.ruleUrl,
+      selected: selected
+    };
+  }
+
+  /** 解析并校验备份 JSON；结构不符返回 null。 */
+  private parseBackup(text: string): BackupPayload | null {
+    if (text.trim().length === 0) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(text) as BackupPayload;
+      if (parsed === null || parsed.app !== 'V2rayM' || parsed.profiles === undefined) {
+        return null;
+      }
+      if (!(parsed.profiles instanceof Array)) {
+        return null;
+      }
+      return parsed;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** 把备份载荷写回本机存储并刷新界面；调用方需先做覆盖确认。 */
+  private applyBackup(payload: BackupPayload): void {
+    const list: Profile[] = payload.profiles;
+    this.profiles = list;
+    FileStore.saveProfiles(this.filesDir, list);
+
+    this.groupNames.clear();
+    if (payload.groupNames !== undefined) {
+      Object.keys(payload.groupNames).forEach((k: string) => {
+        this.groupNames.set(k, String(payload.groupNames[k]));
+      });
+    }
+    this.saveGroupNames();
+
+    this.subQuota.clear();
+    if (payload.subQuota !== undefined) {
+      Object.keys(payload.subQuota).forEach((k: string) => {
+        this.subQuota.set(k, payload.subQuota[k]);
+      });
+    }
+    FileStore.saveSubQuota(this.filesDir, this.subQuota);
+
+    this.rules = payload.rules !== undefined ? payload.rules : [];
+    this.rulesLimit = 50;
+    FileStore.saveRules(this.filesDir, this.rules);
+
+    const scope: AppScope = payload.appScope !== undefined ? payload.appScope : { mode: 'all', packages: [] };
+    FileStore.saveAppScope(this.filesDir, scope);
+    this.appMode = scope.mode;
+    this.appPkgs = scope.packages.join('\n');
+
+    this.settings = payload.settings !== undefined ? payload.settings : FileStore.loadSettings(this.filesDir);
+    FileStore.saveSettings(this.filesDir, this.settings);
+
+    const src: string = payload.rulesSrc !== undefined ? payload.rulesSrc : '';
+    FileStore.writeText2(this.filesDir, 'rules-src.txt', src);
+    this.syncRuleUrlFromStore();
+
+    this.selected = -1;
+    if (payload.selected !== undefined && payload.selected !== null && list.length > 0) {
+      this.selected = this.findProfileByIdentity(list, payload.selected);
+    }
+    if (this.selected < 0 && list.length > 0) {
+      this.selected = 0;
+    }
+
+    this.groupPage.clear();
+    this.openedKeys = [];
+    this.closedKeys = [];
+    this.cacheProfiles = undefined;
+    this.cacheGroups = [];
+    this.bump();
+    this.reconnectSoon();
+  }
+
+  /** 导出全量备份到用户选择的文件；同时更新一份本机快照。 */
+  async exportBackupToFile(): Promise<void> {
+    try {
+      const context = this.getUIContext().getHostContext() as common.Context;
+      const doc = new picker.DocumentViewPicker(context);
+      const options = new picker.DocumentSaveOptions();
+      const stamp: string = Index.backupStamp();
+      options.newFileNames = ['v2raym-backup-' + stamp + '.json'];
+      const uris: string[] = await doc.save(options);
+      if (uris.length === 0) {
+        return;
+      }
+      const payload: BackupPayload = this.buildBackupPayload();
+      const content: string = JSON.stringify(payload, null, 2);
+      const file = fileIo.openSync(uris[0], fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE);
+      fileIo.writeSync(file.fd, content);
+      fileIo.closeSync(file);
+      FileStore.writeText2(this.filesDir, 'backup-snapshot.json', content);
+      this.toast.showToast({ message: '已导出备份（' + String(payload.profiles.length) + ' 个节点）' });
+    } catch (err) {
+      this.toast.showToast({ message: '导出失败：' + String(err) });
+    }
+  }
+
+  /** 从文件导入备份：覆盖当前节点、分组、规则、名单与偏好。 */
+  async importBackupFromFile(): Promise<void> {
+    try {
+      const context = this.getUIContext().getHostContext() as common.Context;
+      const doc = new picker.DocumentViewPicker(context);
+      const options = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      const uris: string[] = await doc.select(options);
+      if (uris.length === 0) {
+        return;
+      }
+      const text: string = Index.readUriText(uris[0]);
+      const payload: BackupPayload | null = this.parseBackup(text);
+      if (payload === null) {
+        this.toast.showToast({ message: '文件不是有效的 V2rayM 备份' });
+        return;
+      }
+      AlertDialog.show({
+        title: '从备份还原',
+        message: '将用备份覆盖当前全部节点、分组、分流规则、分应用名单与偏好（共 ' +
+          String(payload.profiles.length) + ' 个节点），当前本机配置会被替换。',
+        autoCancel: true,
+        primaryButton: { value: '取消', action: () => { } },
+        secondaryButton: {
+          value: '还原',
+          fontColor: '#C62828',
+          action: () => {
+            this.applyBackup(payload);
+            this.toast.showToast({ message: '已从备份还原' });
+          }
+        }
+      });
+    } catch (err) {
+      this.toast.showToast({ message: '导入失败：' + String(err) });
+    }
+  }
+
+  /** 还原本机最近一次导出时留下的快照。 */
+  restoreLocalSnapshot(): void {
+    const text: string = FileStore.readText2(this.filesDir, 'backup-snapshot.json');
+    const payload: BackupPayload | null = this.parseBackup(text);
+    if (payload === null) {
+      this.toast.showToast({ message: '还没有本机备份快照，请先导出一次备份' });
+      return;
+    }
+    AlertDialog.show({
+      title: '还原本机快照',
+      message: '将用本机最近一次备份覆盖当前全部配置（' +
+        String(payload.profiles.length) + ' 个节点），当前配置会被替换。',
+      autoCancel: true,
+      primaryButton: { value: '取消', action: () => { } },
+      secondaryButton: {
+        value: '还原',
+        fontColor: '#C62828',
+        action: () => {
+          this.applyBackup(payload);
+          this.toast.showToast({ message: '已还原本机快照' });
+        }
+      }
+    });
+  }
+
+  static backupStamp(): string {
+    const d: Date = new Date();
+    const pad = (n: number): string => n < 10 ? '0' + String(n) : String(n);
+    return String(d.getFullYear()) + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' +
+      pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
   }
 
   /** 地址栏回车也触发更新，键盘遮挡时少一步 */
@@ -3860,6 +4177,7 @@ struct Index {
   @Builder
   drawer() {
     Row() {
+      Scroll() {
       Column({ space: 12 }) {
         Row() {
           Column({ space: 2 }) {
@@ -3986,6 +4304,46 @@ struct Index {
           .fontSize(13)
           .fontColor('#5A5A5A')
 
+        Text('备份与还原')
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#333333')
+          .margin({ top: 12 })
+
+        Button('导出全量备份')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.exportBackupToFile();
+          })
+
+        Button('从备份文件还原')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.importBackupFromFile();
+          })
+
+        Button('还原本机快照')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.restoreLocalSnapshot();
+          })
+
+        Text('备份含节点、分组名、配额、分流规则、分应用名单与测速偏好；换机或重装后可直接还原。')
+          .fontSize(13)
+          .fontColor('#5A5A5A')
+
         Button('清空全部节点')
           .width('100%')
           .height(44)
@@ -4002,11 +4360,13 @@ struct Index {
 
         Blank()
       }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+    }
       .width('72%')
       .height('100%')
       .padding(16)
       .backgroundColor('#FFFFFF')
-      .alignItems(HorizontalAlign.Start)
       .onClick(() => {
       })
 
@@ -4160,6 +4520,13 @@ struct Index {
       this.toggleRow('后台保活', '连接期间申请长时任务，降低后台被系统回收的概率', this.settings.keepAlive,
         (v: boolean) => { this.patchSettings({ keepAlive: v }); })
 
+      Divider().margin({ top: 8, bottom: 4 })
+      Text('订阅')
+        .fontSize(15)
+        .fontWeight(FontWeight.Bold)
+      this.toggleRow('启动时自动更新', '打开应用后静默更新所有带链接的订阅分组', this.settings.autoUpdateOnStart,
+        (v: boolean) => { this.patchSettings({ autoUpdateOnStart: v }); })
+
       Blank()
     }
     .width('100%')
@@ -4261,6 +4628,82 @@ struct Index {
           .onClick(() => {
             this.exportRulesToFile();
           })
+      }.width('100%')
+
+      Divider().margin({ top: 6, bottom: 2 })
+      Text('快捷开关')
+        .fontSize(15)
+        .fontWeight(FontWeight.Bold)
+        .width('100%')
+      this.toggleRow('绕过中国大陆', '国内域名与 IP 直连，不走代理', this.bypassCnOn(),
+        (v: boolean) => { this.toggleBypassCn(v); })
+      this.toggleRow('拦截广告', 'category-ads-all 广告域名直接阻断', this.blockAdsOn(),
+        (v: boolean) => { this.toggleBlockAds(v); })
+
+      Text('直连域名（命中后直连）')
+        .fontSize(14)
+        .fontColor('#333333')
+        .width('100%')
+      Row({ space: 8 }) {
+        TextInput({ text: this.directDomInput, placeholder: '域名，例如 example.com' })
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .onChange((v: string) => { this.directDomInput = v; })
+        Button('添加')
+          .width(80)
+          .height(40)
+          .fontSize(14)
+          .onClick(() => {
+            this.addDomainToList('direct_dom:', 'DIRECT', '直连域名', this.directDomInput);
+            this.directDomInput = '';
+          })
+      }.width('100%')
+      Flex({ wrap: FlexWrap.Wrap }) {
+        ForEach(this.domainRules('direct_dom:'), (rule: RuleItem) => {
+          Row({ space: 6 }) {
+            Text(rule.value).fontSize(13).fontColor('#2E7D32')
+            Text('✕').fontSize(14).fontColor('#E84026')
+              .onClick(() => { this.removeDomainFromList('direct_dom:', rule.value); })
+          }
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .margin({ right: 8, bottom: 8 })
+          .backgroundColor('#EAF4EC')
+          .borderRadius(10)
+        }, (rule: RuleItem) => rule.id)
+      }.width('100%')
+
+      Text('强制代理域名（命中后走代理）')
+        .fontSize(14)
+        .fontColor('#333333')
+        .width('100%')
+      Row({ space: 8 }) {
+        TextInput({ text: this.proxyDomInput, placeholder: '域名，例如 example.com' })
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .onChange((v: string) => { this.proxyDomInput = v; })
+        Button('添加')
+          .width(80)
+          .height(40)
+          .fontSize(14)
+          .onClick(() => {
+            this.addDomainToList('proxy_dom:', 'PROXY', '代理域名', this.proxyDomInput);
+            this.proxyDomInput = '';
+          })
+      }.width('100%')
+      Flex({ wrap: FlexWrap.Wrap }) {
+        ForEach(this.domainRules('proxy_dom:'), (rule: RuleItem) => {
+          Row({ space: 6 }) {
+            Text(rule.value).fontSize(13).fontColor('#0A59F7')
+            Text('✕').fontSize(14).fontColor('#E84026')
+              .onClick(() => { this.removeDomainFromList('proxy_dom:', rule.value); })
+          }
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .margin({ right: 8, bottom: 8 })
+          .backgroundColor('#EAF1FF')
+          .borderRadius(10)
+        }, (rule: RuleItem) => rule.id)
       }.width('100%')
 
       Text(this.ruleMsg.length > 0 ? this.ruleMsg : '手动改规则后点右上角「保存」；也可以整份从文件或网址覆盖')

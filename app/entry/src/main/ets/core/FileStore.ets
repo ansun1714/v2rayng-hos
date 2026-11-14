@@ -311,7 +311,7 @@ export class FileStore {
   static loadSettings(filesDir: string): AppSettings {
     const fallback: AppSettings = {
       testConcurrency: 24, speedBytes: 5242880,
-      autoConnect: true, failover: true, keepAlive: true
+      autoConnect: true, failover: true, keepAlive: true, autoUpdateOnStart: false
     };
     const text: string = FileStore.readText(FileStore.settingsPath(filesDir));
     if (text.length === 0) {
@@ -334,6 +334,9 @@ export class FileStore {
       }
       if (st.keepAlive === undefined || st.keepAlive === null) {
         st.keepAlive = fallback.keepAlive;
+      }
+      if (st.autoUpdateOnStart === undefined || st.autoUpdateOnStart === null) {
+        st.autoUpdateOnStart = fallback.autoUpdateOnStart;
       }
       return st;
     } catch (err) {
