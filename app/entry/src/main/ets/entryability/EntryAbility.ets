@@ -18,6 +18,10 @@ const WATCHDOG_ABILITY: string = 'VpnWatchdogExtAbility';
 const WATCHDOG_CYCLE_MS: number = 1200000;
 
 export default class EntryAbility extends UIAbility {
+  /** 上一次成功注册看门狗的时刻：用来给 refreshWatchdog 限频 */
+  private lastWatchdogRefresh: number = 0;
+  /** 看门狗重注册的最小间隔 */
+  static readonly WATCHDOG_REFRESH_MS: number = 1800000;
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'EntryAbility onCreate');
     // 界面进程的日志走 ui.log，与扩展进程的 vpn.log 分开，避免两个进程
@@ -26,8 +30,10 @@ export default class EntryAbility extends UIAbility {
     // 注入应用级 UIAbilityContext：长时任务必须由它申请，且 userStopped 的
     // 持久化要在页面出现、用户点击之前就恢复完成。
     KeepAliveManager.getInstance().init(this.context as common.UIAbilityContext);
-    // 注册系统级看门狗：UI 被冻结时页面定时器全停，只有系统周期任务还能兜底
-    this.registerWatchdog();
+    // 注册系统级看门狗：UI 被冻结时页面定时器全停，只有系统周期任务还能兜底。
+    // 走 refreshWatchdog 而不是直接 startWork：进程重启时旧任务往往还在，
+    // 直接 start 只会得到 9700005 already added（09:39:17 日志第一条就是这个）
+    this.refreshWatchdog();
     // 看门狗拉起本 Ability 时带 fromWatchdog=true：只置既有 needRecover 标记，
     // 由页面的 consumeNeedRecover() 走同一条恢复链路，不新增第二套恢复入口。
     const fromWatchdog: Object | undefined = want.parameters?.fromWatchdog;
@@ -51,11 +57,43 @@ export default class EntryAbility extends UIAbility {
 
   /**
    * 注册系统级周期看门狗（WorkSchedulerExtensionAbility）。
-   * workId 固定 ⇒ 每次 onCreate 重复 startWork 只是覆盖同一任务，天然幂等；
+   * workId 固定 ⇒ 每次重复 startWork 都是同一个任务；
    * isPersisted=true ⇒ 设备重启后任务仍在；isRepeat + 20 分钟 ⇒ 至少每 20 分钟
    * 被系统唤起一次，用来兜住「UI 进程被冻结、页面定时器全停」的场景。
+   * 注意：重复 startWork 并不幂等，任务已存在时会抛 9700005，所以注册统一走 refreshWatchdog。
    */
   private registerWatchdog(): void {
+    this.startWatchdogWork('watchdog: work registered');
+  }
+
+  /**
+   * 重新注册看门狗。真机 11-14 日志证据：01:57 注册、07:07 只 tick 一次、
+   * 07:23 收到 work stop 之后到 09:10 再无任何 tick —— 系统的周期任务会被
+   * 静默停掉。单纯再调一次 startWork 只会得到 9700005（already added），
+   * 必须先用 stopAndClearWorks 把旧的清掉（stopWork 单条清理在实际设备上
+   * 没能生效，日志里 09:29 仍是 already added），再重新注册。
+   * 限频 30 分钟：频繁切前后台不该反复重置周期计时，否则永远等不到第一次 tick。
+   */
+  private refreshWatchdog(): void {
+    const filesDir: string = this.context.filesDir;
+    const now: number = Date.now();
+    if (this.lastWatchdogRefresh > 0 &&
+      now - this.lastWatchdogRefresh < EntryAbility.WATCHDOG_REFRESH_MS) {
+      return;
+    }
+    this.lastWatchdogRefresh = now;
+    try {
+      workScheduler.stopAndClearWorks();
+      FileStore.appendLog(filesDir, 'watchdog: old work cleared');
+    } catch (err) {
+      const be: BusinessError = err as BusinessError;
+      FileStore.appendLog(filesDir, 'watchdog: stopAndClearWorks failed code=' +
+        String(be.code !== undefined ? be.code : -1) + ' msg=' + String(be.message));
+    }
+    this.startWatchdogWork('watchdog: work refreshed');
+  }
+
+  private startWatchdogWork(tag: string): void {
     const filesDir: string = this.context.filesDir;
     const work: workScheduler.WorkInfo = {
       workId: WATCHDOG_WORK_ID,
@@ -67,8 +105,8 @@ export default class EntryAbility extends UIAbility {
     };
     try {
       workScheduler.startWork(work);
-      FileStore.appendLog(filesDir, 'watchdog: work registered (cycle=' +
-        String(WATCHDOG_CYCLE_MS) + 'ms)');
+      this.lastWatchdogRefresh = Date.now();
+      FileStore.appendLog(filesDir, tag + ' (cycle=' + String(WATCHDOG_CYCLE_MS) + 'ms)');
     } catch (err) {
       const be: BusinessError = err as BusinessError;
       FileStore.appendLog(filesDir, 'watchdog: startWork failed code=' +
@@ -118,6 +156,8 @@ export default class EntryAbility extends UIAbility {
   onForeground(): void {
     const mgr: KeepAliveManager = KeepAliveManager.getInstance();
     mgr.snapshot('onForeground');
+    // 每次回前台都把看门狗重置一次：系统的周期任务会被静默停掉（见 refreshWatchdog 注释）
+    this.refreshWatchdog();
     mgr.ensureRunning(this.context as common.UIAbilityContext, true)
       .catch((err: Error) => {
         hilog.error(DOMAIN, TAG, 'ensure onForeground failed: %{public}s', err.message);

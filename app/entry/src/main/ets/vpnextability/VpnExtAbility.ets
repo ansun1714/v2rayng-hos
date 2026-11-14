@@ -4,7 +4,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { vpnExtension, VpnExtensionAbility, connection } from '@kit.NetworkKit';
 import { NgCore } from '../core/NgCore';
 import { FileStore } from '../core/FileStore';
-import { DelayReq, DelayRes, DelayBody } from '../core/Model';
+import { DelayReq, DelayRes, DelayBody, AppScope } from '../core/Model';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'V2rayNG-VpnExt';
@@ -155,6 +155,21 @@ export default class VpnExtAbility extends VpnExtensionAbility {
       isBlocking: false,
       isInternal: false
     };
+
+    // 分应用代理（参考 v2rayH）：allow=只有白名单应用走隧道，block=黑名单应用直连。
+    // 两者都不设时全部应用走隧道。包名列表为空时忽略，避免误把全部流量或零流量圈进来。
+    try {
+      const scope: AppScope = FileStore.loadAppScope(filesDir);
+      if (scope.packages.length > 0 && scope.mode === 'allow') {
+        vpnConfig.trustedApplications = scope.packages;
+        FileStore.appendLog(filesDir, 'app scope: allow ' + String(scope.packages.length) + ' packages');
+      } else if (scope.packages.length > 0 && scope.mode === 'block') {
+        vpnConfig.blockedApplications = scope.packages;
+        FileStore.appendLog(filesDir, 'app scope: block ' + String(scope.packages.length) + ' packages');
+      }
+    } catch (err) {
+      FileStore.appendLog(filesDir, 'app scope load failed: ' + String(err));
+    }
 
     try {
       const conn: vpnExtension.VpnConnection = vpnExtension.createVpnConnection(this.context);

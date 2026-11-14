@@ -6,7 +6,7 @@ import { vpnExtension, http, connection } from '@kit.NetworkKit';
 import { PromptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { ProxyLink } from '../core/ProxyLink';
-import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem } from '../core/Model';
+import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope } from '../core/Model';
 import { ConfigBuilder } from '../core/ConfigBuilder';
 import { FileStore } from '../core/FileStore';
 import { KeepAliveManager } from '../core/KeepAliveManager';
@@ -36,6 +36,21 @@ const EXIT_URL_BACKUP: string = 'https://api.ip.sb/geoip';
 const EXIT_URL_IPIP: string = 'https://myip.ipip.net/';
 // 交叉校验源：另一家 v4-only 端点，只用来核对主源报的 IP 是否可信（不参与显示）
 const EXIT_URL_CROSS: string = 'https://ipv4.icanhazip.com/';
+// 带宽测速：单一端点不可靠 —— 11-14 09:30 用 Cloudflare speed 接口在 Warp 出口
+// 上两枪全超时，09:36 换 CacheFly 的 /1mb.test 又直接 404。改成候选列表 + HEAD 预检：
+// 先并发探一遍哪些端点真的返回 200，再用第一个可用的端点下载计时。
+// 另外 1MB 文件测出来的 783KB/s 明显偏低（该节点订阅标注 64.59Mbps），
+// 是被 TLS/TCP 慢启动吃掉了，所以探测用小文件、计时用 5~10MB 大文件，中间加一次预热。
+const SPEED_PROBES: string[] = [
+  'https://speed.cloudflare.com/__down?bytes=1048576',
+  'https://speed.hetzner.de/1MB.bin',
+  'https://proof.ovh.net/files/1Mb.dat'
+];
+const SPEED_TESTS: string[] = [
+  'https://speed.cloudflare.com/__down?bytes=5242880',
+  'https://speed.hetzner.de/10MB.bin',
+  'https://proof.ovh.net/files/10Mb.dat'
+];
 
 interface ExitGeo {
   ip?: string;
@@ -106,6 +121,8 @@ class NodeRow {
   nodeIndex: number = -1;
   name: string = '';
   delay: number = -1;
+  /** 下载测速结果（KB/s，-1 未测）；与延迟一起显示在节点行 */
+  speed: number = -1;
   addr: string = '';
   selected: boolean = false;
   moreLeft: number = 0;
@@ -220,8 +237,26 @@ struct Index {
   private selectedKept: boolean = true;
   /** 已熔断：当前节点无可用出口，exitInfo 是提示文案而非真出口，置灰显示 */
   @State exitBlocked: boolean = false;
+  /** 熔断时刻与当时的累计下行字节：用于区分「节点真死」和「后台探测被冻结」 */
+  private exitBlockedAt: number = 0;
+  private exitBlockedDown: number = 0;
+  /** 当前这次连接已自动切换过几次节点：防止全网节点都死时疯狂重连 */
+  private failoverCount: number = 0;
+  /** 最近一次读到的累计下行：判断隧道是否真有流量在走 */
+  private lastTotalDown: number = 0;
+  /** 已连接节点最近一次测速成功的延迟：故障转移优先选它 */
+  private failoverTried: string[] = [];
   /** 连续多少枪全空后停止重试（约 1 分钟），避免死节点上无限转圈 */
   static readonly EXIT_EMPTY_LIMIT: number = 8;
+  /** 熔断后的自动复检间隔：不再永久停，60s 后自己爬起来再试一枪 */
+  static readonly EXIT_RECHECK_MS: number = 60000;
+  /** 单次连接最多自动切换节点次数 */
+  static readonly FAILOVER_MAX: number = 2;
+  /** 判定「隧道确实有流量」的最小增量（4KB），避免把噪声当成通 */
+  static readonly FLOW_ALIVE_BYTES: number = 4096;
+  /** 带宽测速进行中 / 结果文案（显示在出口卡片上） */
+  @State speedBusy: boolean = false;
+  @State speedInfo: string = '';
   @State summary: string = 'mihomo 内核 · 国内直连 / 国外代理';
   @State linkInput: string = '';
   @State subInput: string = '';
@@ -261,6 +296,11 @@ struct Index {
   @State ruleMsg: string = '';
   /** 规则列表一次渲染多少条：社区规则集动辄几千条，分页渲染避免列表卡死。 */
   @State rulesLimit: number = 50;
+
+  // 分应用代理（设置页）
+  @State appScopePanel: boolean = false;
+  @State appMode: string = 'all';
+  @State appPkgs: string = '';
 
   // 编辑面板
   @State editing: number = -1;
@@ -679,8 +719,112 @@ struct Index {
       if (this.totalText !== total) {
         this.totalText = total;
       }
+      // 累计下行用于两件事：证明隧道确实有流量；熔断后判断是节点死还是探测被冻结
+      if (state.totalDown !== undefined) {
+        this.lastTotalDown = state.totalDown;
+      }
+      // 熔断不再永久停：每 60s 自己复检一次，有流量就重试探测，没流量就尝试故障转移
+      this.tickExitBlocked();
     } catch (err) {
     }
+  }
+
+  /**
+   * 熔断后的自愈节拍（由 readState 每秒驱动，内部按 60s 节流）。
+   * 背景：真机 11-14 03:32–04:33 连续 8 枪全超时后熔断，之后 4 小时 37 分
+   * 界面一直停在「当前节点无可用出口」，而同一时段累计下行还有 357MB ——
+   * 说明后台 UI 定时器被系统节流后才凑满 8 枪，节点根本没死。所以：
+   * - 熔断期间累计下行仍在增长 ⇒ 判定探测链路问题，重新探一枪等它自己恢复；
+   * - 累计下行也没增长 ⇒ 才认为是节点真不通，尝试自动切换。
+   */
+  private tickExitBlocked(): void {
+    if (!this.exitBlocked || !this.running || this.exitBusy) {
+      return;
+    }
+    const now: number = Date.now();
+    if (this.exitBlockedAt === 0) {
+      this.exitBlockedAt = now;
+      this.exitBlockedDown = this.lastTotalDown;
+      return;
+    }
+    if (now - this.exitBlockedAt < Index.EXIT_RECHECK_MS) {
+      return;
+    }
+    const grew: boolean = this.lastTotalDown - this.exitBlockedDown > Index.FLOW_ALIVE_BYTES;
+    this.exitBlockedAt = now;
+    this.exitBlockedDown = this.lastTotalDown;
+    if (grew) {
+      // 有流量就不动节点，只把探测重新跑一遍；失败会按 EXIT_EMPTY_LIMIT 再次熔断
+      FileStore.appendLog(this.filesDir,
+        'exit probe blocked but traffic alive (down=' + String(this.lastTotalDown) +
+        '), retry probe');
+      this.refreshExit(1);
+      return;
+    }
+    this.tryFailover('no traffic for ' + String(Index.EXIT_RECHECK_MS / 1000) + 's');
+  }
+
+  /**
+   * 自动故障转移：当前节点判定不可用且确实没有流量时，换一个节点。
+   * 候选顺序：本组内已测速成功（delay>=0）按延迟升序 → 其它组已测速成功
+   * → 未测速节点按列表顺序轮转。已试过的 server:port 不重复试，最多 FAILOVER_MAX 次。
+   */
+  private tryFailover(reason: string): void {
+    if (this.profiles.length < 2 || this.selected < 0 || this.selected >= this.profiles.length) {
+      return;
+    }
+    if (this.failoverCount >= Index.FAILOVER_MAX) {
+      FileStore.appendLog(this.filesDir, 'failover: limit reached (' +
+        String(Index.FAILOVER_MAX) + '), stay on current node');
+      // 自动切换额度用尽且确实没流量：这才是「节点不可用」，给明确可操作提示
+      this.exitInfo = '当前节点无可用出口，请手动切换';
+      return;
+    }
+    const cur: Profile = this.profiles[this.selected];
+    const curKey: string = cur.server + ':' + String(cur.port);
+    if (this.failoverTried.indexOf(curKey) < 0) {
+      this.failoverTried.push(curKey);
+    }
+    let best: number = -1;
+    let bestDelay: number = 999999;
+    for (let i = 0; i < this.profiles.length; i++) {
+      const p: Profile = this.profiles[i];
+      const key: string = p.server + ':' + String(p.port);
+      if (i === this.selected || this.failoverTried.indexOf(key) >= 0) {
+        continue;
+      }
+      if (p.delay >= 0 && p.delay < bestDelay) {
+        bestDelay = p.delay;
+        best = i;
+      }
+    }
+    if (best < 0) {
+      // 没有任何已测速成功的候选：按列表顺序找一个没试过的，避免全网死节点时死磕
+      for (let step = 1; step < this.profiles.length; step++) {
+        const i: number = (this.selected + step) % this.profiles.length;
+        const key: string = this.profiles[i].server + ':' + String(this.profiles[i].port);
+        if (this.failoverTried.indexOf(key) < 0) {
+          best = i;
+          break;
+        }
+      }
+    }
+    if (best < 0) {
+      FileStore.appendLog(this.filesDir, 'failover: no untried candidate, stay');
+      return;
+    }
+    this.failoverCount++;
+    const name: string = this.profiles[best].name;
+    FileStore.appendLog(this.filesDir, 'failover #' + String(this.failoverCount) +
+      ' (' + reason + ') -> ' + name);
+    this.exitEmptyStreak = 0;
+    this.exitBlocked = false;
+    this.exitBlockedAt = 0;
+    if (this.exitInfo.length > 0) {
+      this.exitInfo = '';
+    }
+    this.toast.showToast({ message: '节点无流量，已自动切换到 ' + name });
+    this.selectNode(best, true);
   }
 
   static human(value: number): string {
@@ -776,11 +920,20 @@ struct Index {
    * 点选节点：只改「旧选中」「新选中」两行并精确通知，
    * 不重建行数组、不触发整页 build —— 这是切换节点手感的关键。
    */
-  selectNode(nodeIndex: number): void {
+  selectNode(nodeIndex: number, fromFailover: boolean = false): void {
     if (nodeIndex === this.selected || nodeIndex < 0) {
       return;
     }
+    if (!fromFailover) {
+      // 用户自己点的节点：清空自动切换计数，给他完整的重试额度
+      this.failoverCount = 0;
+      this.failoverTried = [];
+    }
     const prev: number = this.selected;
+    // 换了节点就换了出口，上一个节点的带宽结果不再代表现在
+    if (this.speedInfo.length > 0) {
+      this.speedInfo = '';
+    }
     this.selected = nodeIndex;
     this.dataSource.markSelected(prev, false);
     this.dataSource.markSelected(nodeIndex, true);
@@ -857,6 +1010,7 @@ struct Index {
         row.nodeIndex = index;
         row.name = p.name;
         row.delay = p.delay;
+        row.speed = p.speed !== undefined ? p.speed : -1;
         row.addr = p.type.toUpperCase() + ' · ' + p.server + ':' + String(p.port);
         row.selected = index === this.selected;
         row.firstInBlock = false;
@@ -1191,6 +1345,168 @@ struct Index {
   }
 
   /**
+   * 下载测速专用：只关心「实际下载了多少字节、用了多久」，不做内容解码。
+   * 返回 [字节数, 耗时毫秒]；失败返回 [0, 耗时]。只走 https（理由同 httpGet）。
+   */
+  async httpGetBytes(url: string, timeoutMs: number): Promise<number[]> {
+    const started: number = Date.now();
+    if (!url.toLowerCase().startsWith('https://')) {
+      return [0, 0];
+    }
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: timeoutMs,
+        readTimeout: timeoutMs,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        header: { 'User-Agent': 'v2rayNG-harmony/1.0' }
+      });
+      const ms: number = Date.now() - started;
+      if (resp.responseCode !== 200) {
+        FileStore.appendLog(this.filesDir, 'speedtest non-200: ' + String(resp.responseCode));
+        return [0, ms];
+      }
+      const raw: ArrayBuffer = resp.result as ArrayBuffer;
+      let bytes: number = 0;
+      if (raw !== undefined && raw !== null) {
+        bytes = raw.byteLength;
+      }
+      return [bytes, ms];
+    } catch (err) {
+      const be = err as BusinessError;
+      FileStore.appendLog(this.filesDir, 'speedtest err: code=' +
+        String(be.code !== undefined ? be.code : -1) + ' msg=' + String(be.message));
+      return [0, Date.now() - started];
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /** 测速端点预检：HEAD 只看状态码，不拉内容，成本远低于直接下载。 */
+  async httpHead(url: string, timeoutMs: number): Promise<boolean> {
+    if (!url.toLowerCase().startsWith('https://')) {
+      return false;
+    }
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(url, {
+        method: http.RequestMethod.HEAD,
+        connectTimeout: timeoutMs,
+        readTimeout: timeoutMs,
+        header: { 'User-Agent': 'v2rayNG-harmony/1.0' }
+      });
+      const code: number = resp.responseCode;
+      return code === 200 || code === 206;
+    } catch (err) {
+      return false;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /**
+   * 挑一个当前节点真能访问的测速端点，返回下标；全都不通返回 -1。
+   * 并发 HEAD 三个小文件候选，取第一个 200 的；全都不通时再顺序 GET 兜底
+   * （有些 CDN 不接受 HEAD）。
+   */
+  private async pickSpeedIndex(): Promise<number> {
+    const a: Promise<boolean> = this.httpHead(SPEED_PROBES[0], 4000);
+    const b: Promise<boolean> = this.httpHead(SPEED_PROBES[1], 4000);
+    const c: Promise<boolean> = this.httpHead(SPEED_PROBES[2], 4000);
+    const ok: boolean[] = await Promise.all([a, b, c]);
+    for (let i = 0; i < ok.length; i++) {
+      if (ok[i]) {
+        FileStore.appendLog(this.filesDir, 'speedtest endpoint #' + String(i) + ': ' + SPEED_TESTS[i]);
+        return i;
+      }
+    }
+    FileStore.appendLog(this.filesDir, 'speedtest: no endpoint passed HEAD, try GET fallback');
+    for (let i = 0; i < SPEED_PROBES.length; i++) {
+      const small: number[] = await this.httpGetBytes(SPEED_PROBES[i], 8000);
+      if (small[0] > 0) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * 带宽测速（参考 v2rayH 的 Speedtest 式做法，做简化版）：
+   * 选端点 → 小文件预热 → 大文件计时 → 换算 KB/s。
+   * 必须已连接：未连接时请求走本机宽带，测出来的是宽带而不是节点。
+   */
+  async speedTestCurrent(): Promise<void> {
+    if (this.speedBusy) {
+      return;
+    }
+    if (!this.running) {
+      this.toast.showToast({ message: '请先连接节点再测带宽' });
+      return;
+    }
+    if (this.selected < 0 || this.selected >= this.profiles.length) {
+      return;
+    }
+    const idx: number = this.selected;
+    const name: string = this.profiles[idx].name;
+    this.speedBusy = true;
+    this.speedInfo = '测速中…';
+    FileStore.appendLog(this.filesDir, 'speedtest start: ' + name);
+    try {
+      const ti: number = await this.pickSpeedIndex();
+      if (ti < 0) {
+        this.speedInfo = '测速失败';
+        FileStore.appendLog(this.filesDir, 'speedtest fail: ' + name + ' (no reachable endpoint)');
+        this.toast.showToast({ message: '测速失败：三个测速端点都不可达' });
+        return;
+      }
+      // 预热：先把 TCP/TLS 慢启动跑掉，这一枪不计时
+      await this.httpGetBytes(SPEED_PROBES[ti], 12000);
+      let got: number[] = await this.httpGetBytes(SPEED_TESTS[ti], 20000);
+      if (got[0] <= 0) {
+        // 大文件超时（慢节点下 5MB 可能读不完）：退回小文件计时，宁可精度低也别没结果
+        got = await this.httpGetBytes(SPEED_PROBES[ti], 12000);
+      }
+      const bytes: number = got[0];
+      const ms: number = got[1];
+      if (bytes <= 0 || ms <= 0) {
+        this.speedInfo = '测速失败';
+        FileStore.appendLog(this.filesDir, 'speedtest fail: ' + name + ' (download timeout)');
+        this.toast.showToast({ message: '测速失败：下载没有完成' });
+        return;
+      }
+      const kbPerSec: number = Math.round(bytes / 1024 * 1000 / ms);
+      // 选中节点可能在测速期间被切走：只回写到发起时的那个节点
+      for (let i = 0; i < this.profiles.length; i++) {
+        const p: Profile = this.profiles[i];
+        if (p.name === name && i === idx) {
+          p.speed = kbPerSec;
+          break;
+        }
+      }
+      FileStore.saveProfiles(this.filesDir, this.profiles);
+      this.bump();
+      const text: string = Index.speedText(kbPerSec);
+      this.speedInfo = text;
+      FileStore.appendLog(this.filesDir, 'speedtest done: ' + name + ' ' + text);
+      this.toast.showToast({ message: name + ' 带宽 ' + text });
+    } finally {
+      this.speedBusy = false;
+    }
+  }
+
+  /** 下载速率文案：>= 1024KB/s 换成 MB/s */
+  static speedText(kb: number): string {
+    if (kb < 0) {
+      return '';
+    }
+    if (kb >= 1024) {
+      return (Math.round(kb / 1024 * 10) / 10).toFixed(1) + 'MB/s';
+    }
+    return String(kb) + 'KB/s';
+  }
+
+  /**
    * 出口 IP 归属。已连接时代理生效、本应用自身没被 protect，
    * 这里的 HTTP 请求就是经节点出去的，返回的 IP 即节点出口，不是本地宽带。
    */
@@ -1210,6 +1526,16 @@ struct Index {
       waited++;
     }
     if (seq !== this.exitSeq) {
+      return;
+    }
+    if (!this.running) {
+      // 等待窗口内隧道没起来（断开中 / 刚断开）：此时请求走的是家宽，
+      // 探出来的会是「中国 江苏」这种直连出口。宁可显示空，也不能把它当成节点出口
+      // —— 这正是之前界面一直停在「中国江苏」的原因（09:32:23 那枪）。
+      this.exitBusy = false;
+      if (this.exitInfo.length > 0) {
+        this.exitInfo = '';
+      }
       return;
     }
     let text: string = '';
@@ -1261,7 +1587,11 @@ struct Index {
           String(this.exitEmptyStreak) + ' empty attempts, stop retrying');
         this.exitBusy = false;
         this.exitBlocked = true;
-        this.exitInfo = '当前节点无可用出口，请切换节点';
+        // 记下熔断时刻与当时的累计下行：60s 后由 tickExitBlocked 判断是节点死
+        // 还是后台探测被冻结（真机 03:32 熔断后白卡了 4 小时 37 分）
+        this.exitBlockedAt = Date.now();
+        this.exitBlockedDown = this.lastTotalDown;
+        this.exitInfo = '出口探测超时，正在确认节点状态…';
         return;
       }
       const fast: boolean = attempt < 6;
@@ -2046,6 +2376,36 @@ struct Index {
 
   // ---------- 分流规则 ----------
 
+  // ---------- 分应用代理 ----------
+
+  openAppScope(): void {
+    const scope: AppScope = FileStore.loadAppScope(this.filesDir);
+    this.appMode = scope.mode;
+    let text: string = '';
+    scope.packages.forEach((pkg: string, i: number) => {
+      text = text + (i === 0 ? '' : '\n') + pkg;
+    });
+    this.appPkgs = text;
+    this.appScopePanel = true;
+    this.drawerOpen = false;
+  }
+
+  saveAppScopeConfig(): void {
+    const lines: string[] = this.appPkgs.split('\n');
+    const pkgs: string[] = [];
+    lines.forEach((line: string) => {
+      const pkg: string = line.trim();
+      if (pkg.length > 0 && pkgs.indexOf(pkg) < 0) {
+        pkgs.push(pkg);
+      }
+    });
+    const scope: AppScope = { mode: this.appMode, packages: pkgs };
+    FileStore.saveAppScope(this.filesDir, scope);
+    FileStore.appendLog(this.filesDir, 'app scope saved: mode=' + this.appMode +
+      ' packages=' + String(pkgs.length));
+    this.toast.showToast({ message: '已保存，重新连接后生效' });
+  }
+
   openRules(): void {
     this.ruleEditing = -1;
     this.rulePanel = true;
@@ -2353,6 +2713,9 @@ struct Index {
     // 自动恢复（fromRecover=true）不改该标记，其前提是 canAutoRecover() 已放行。
     if (!fromRecover) {
       KeepAliveManager.getInstance().setUserStopped(false);
+      // 用户主动连接：故障转移额度与已试节点清空
+      this.failoverCount = 0;
+      this.failoverTried = [];
       // 取消挂起的自动恢复：否则它稍后触发 connect(true) 时 running 已为 true，
       // 会误走进「断开」分支，把用户刚连上的 VPN 又断掉。
       if (this.recoverTimer >= 0) {
@@ -2450,6 +2813,9 @@ struct Index {
     this.recovering = false;
     this.lostCount = 0;
     this.recoverAttempt = 0;
+    // 断开即重置故障转移额度
+    this.failoverCount = 0;
+    this.failoverTried = [];
     // 显式释放长时任务：本函数会先把 running 置 false 并写 state.json，
     // readState() 的 true→false 边沿会因此丢失，不能只依赖它来 stop。
     this.releaseKeepAlive();
@@ -2655,6 +3021,12 @@ struct Index {
           .onClick(() => {
             this.testOne(row.nodeIndex);
           })
+
+        if (row.speed >= 0) {
+          Text('↓' + Index.speedText(row.speed))
+            .fontSize(13)
+            .fontColor('#0A59F7')
+        }
 
         if (row.selected) {
           Text('✓').fontSize(17).fontColor('#0A59F7')
@@ -2930,6 +3302,16 @@ struct Index {
           .fontSize(13)
           .fontColor('#5A5A5A')
 
+        Button('设置 · 分应用代理')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.openAppScope();
+          })
+
         Button('设置 · 分流规则')
           .width('100%')
           .height(44)
@@ -2973,6 +3355,85 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+  }
+
+  @Builder
+  appModeBtn(label: string, mode: string) {
+    Button(label)
+      .height(38)
+      .fontSize(14)
+      .layoutWeight(1)
+      .backgroundColor(this.appMode === mode ? '#0A59F7' : '#F0F0F0')
+      .fontColor(this.appMode === mode ? '#FFFFFF' : '#333333')
+      .onClick(() => {
+        this.appMode = mode;
+      })
+  }
+
+  @Builder
+  appScopePanelView() {
+    Column({ space: 12 }) {
+      Row({ space: 8 }) {
+        Button('返回')
+          .width(76)
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.appScopePanel = false;
+          })
+        Text('分应用代理')
+          .fontSize(19)
+          .fontWeight(FontWeight.Bold)
+          .layoutWeight(1)
+        Button('保存')
+          .width(84)
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#0A59F7')
+          .fontColor('#FFFFFF')
+          .onClick(() => {
+            this.saveAppScopeConfig();
+          })
+      }
+      .width('100%')
+
+      Text('全部走代理：不限制。仅代理选中：只有名单内应用走隧道，其余直连。排除选中：名单内应用直连，其余走隧道。')
+        .fontSize(13)
+        .fontColor('#5A5A5A')
+
+      Row({ space: 8 }) {
+        this.appModeBtn('全部走代理', 'all')
+        this.appModeBtn('仅代理选中', 'allow')
+        this.appModeBtn('排除选中', 'block')
+      }
+      .width('100%')
+
+      TextArea({ placeholder: '每行一个包名，例如 com.tencent.mm', text: this.appPkgs })
+        .height(220)
+        .width('100%')
+        .fontSize(14)
+        .backgroundColor('#F5F5F5')
+        .onChange((value: string) => {
+          this.appPkgs = value;
+        })
+
+      Text('包名可在系统「设置 → 应用和服务」里查看。本应用没有枚举其它应用的权限，因此不做自动勾选。')
+        .fontSize(12)
+        .fontColor('#8A8A8A')
+
+      Text('改动后需要重新连接代理才会生效。模式为「全部走代理」时名单不生效。')
+        .fontSize(12)
+        .fontColor('#B26A00')
+
+      Blank()
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+    .backgroundColor('#FFFFFF')
+    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder
@@ -3394,25 +3855,43 @@ struct Index {
           }
 
           if (this.running) {
-            // 出口 IP + 国家地区单独占一行：和流量挤在一起时地区会被省略掉
-            Text(this.exitInfo.length > 0 ? this.exitInfo : (this.exitBusy ? '正在测出口 IP…' : '点此测出口 IP'))
-              .fontSize(14)
-              .fontColor(this.exitBlocked ? '#7A7A7A' : (this.exitInfo.length > 0 ? '#2E7D32' : '#7A7A7A'))
-              .width('100%')
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-              .borderRadius(10)
-              .backgroundColor(this.exitBlocked ? '#F2F3F5' : '#EAF6EA')
-              .border({ width: 1, color: this.exitBlocked ? '#E2E4E8' : '#CFE8CF' })
-              .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
-              .onClick(() => {
-                if (!this.exitBusy) {
-                  this.exitEmptyStreak = 0;
-                  this.exitBlocked = false;
-                  this.refreshExit(1);
-                }
-              })
+            // 出口 IP + 国家地区单独占一行：和流量挤在一起时地区会被省略掉。
+            // 右侧空处放带宽测速入口：必须已连接才有意义（未连接测的是本机宽带）。
+            Row({ space: 8 }) {
+              Text(this.exitInfo.length > 0 ? this.exitInfo :
+                (this.exitBusy ? '正在测出口 IP…' :
+                  (this.speedBusy ? '正在测带宽…' : '点此测出口 IP')))
+                .fontSize(14)
+                .fontColor(this.exitBlocked ? '#7A7A7A' : (this.exitInfo.length > 0 ? '#2E7D32' : '#7A7A7A'))
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .onClick(() => {
+                  if (!this.exitBusy) {
+                    this.exitEmptyStreak = 0;
+                    this.exitBlocked = false;
+                    this.exitBlockedAt = 0;
+                    this.refreshExit(1);
+                  }
+                })
+              Text(this.speedBusy ? '测速中' : (this.speedInfo.length > 0 ? this.speedInfo : '带宽测速'))
+                .fontSize(12)
+                .fontColor('#0A59F7')
+                .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                .borderRadius(6)
+                .backgroundColor('#DCE7FF')
+                .onClick(() => {
+                  if (!this.speedBusy) {
+                    this.speedTestCurrent();
+                  }
+                })
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+            .borderRadius(10)
+            .backgroundColor(this.exitBlocked ? '#F2F3F5' : '#EAF6EA')
+            .border({ width: 1, color: this.exitBlocked ? '#E2E4E8' : '#CFE8CF' })
+            .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
           }
 
           // 测速进度单独一张卡：和流量计数挤一行会被省略号吃掉
@@ -3529,6 +4008,10 @@ struct Index {
 
       if (this.rulePanel) {
         this.rulesPanel()
+      }
+
+      if (this.appScopePanel) {
+        this.appScopePanelView()
       }
 
       if (this.rulePanel && this.ruleEditing >= 0) {

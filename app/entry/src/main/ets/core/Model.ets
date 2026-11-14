@@ -48,7 +48,14 @@ export class Profile {
   realityPbk: string = '';
   realitySid: string = '';
   delay: number = -1;   // 测速结果（毫秒），-1 未测
+  speed: number = -1;   // 下载测速结果（KB/s），-1 未测
   subId: string = '';   // 来源订阅链接，空表示手动/内置
+}
+
+/** 分应用代理模式：all=全部走代理，allow=仅选中走代理，block=排除选中 */
+export interface AppScope {
+  mode: string;         // all | allow | block
+  packages: string[];   // 包名列表（allow 用作白名单，block 用作黑名单）
 }
 
 export class CoreState {

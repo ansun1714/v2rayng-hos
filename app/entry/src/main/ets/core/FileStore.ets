@@ -4,7 +4,7 @@
 import { fileIo } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { resourceManager } from '@kit.LocalizationKit';
-import { Profile, RuleItem } from './Model';
+import { AppScope, Profile, RuleItem } from './Model';
 
 /** state.json 中由 UI 进程维护的用户意图标记（旧版本文件里没有，按 false 处理）。 */
 interface StateFlag {
@@ -269,6 +269,38 @@ export class FileStore {
 
   static saveProfiles(filesDir: string, profiles: Profile[]): void {
     FileStore.writeText(FileStore.profilesPath(filesDir), JSON.stringify(profiles));
+  }
+
+  /** 分应用代理配置：all=全部走代理，allow=仅选中走代理，block=排除选中。 */
+  static appScopePath(filesDir: string): string {
+    return FileStore.ensureDir(filesDir) + '/app-scope.json';
+  }
+
+  static loadAppScope(filesDir: string): AppScope {
+    const text: string = FileStore.readText(FileStore.appScopePath(filesDir));
+    const fallback: AppScope = { mode: 'all', packages: [] };
+    if (text.length === 0) {
+      return fallback;
+    }
+    try {
+      const scope: AppScope = JSON.parse(text) as AppScope;
+      if (scope.mode === undefined || scope.mode === null || scope.mode.length === 0) {
+        scope.mode = 'all';
+      }
+      if (scope.mode !== 'allow' && scope.mode !== 'block') {
+        scope.mode = 'all';
+      }
+      if (scope.packages === undefined || scope.packages === null) {
+        scope.packages = [];
+      }
+      return scope;
+    } catch (err) {
+      return fallback;
+    }
+  }
+
+  static saveAppScope(filesDir: string, scope: AppScope): void {
+    FileStore.writeText(FileStore.appScopePath(filesDir), JSON.stringify(scope));
   }
 
   /** 分流规则：用户可手动改、从文件导入、从网址订阅覆盖。 */
