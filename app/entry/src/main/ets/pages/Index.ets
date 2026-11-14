@@ -1803,8 +1803,8 @@ struct Index {
    * （有些 CDN 不接受 HEAD）。
    */
   /** 按当前测速包大小设置，返回第 ti 个候选端点的计时下载地址。 */
-  private speedTestUrl(ti: number): string {
-    const n: number = this.settings.speedBytes;
+  private speedTestUrl(ti: number, bytes?: number): string {
+    const n: number = bytes !== undefined ? bytes : this.settings.speedBytes;
     if (ti === 0) {
       return 'https://speed.cloudflare.com/__down?bytes=' + String(n);
     }
@@ -1812,6 +1812,29 @@ struct Index {
       return n >= 10485760 ? 'https://speed.hetzner.de/10MB.bin' : 'https://speed.hetzner.de/1MB.bin';
     }
     return n >= 10485760 ? 'https://proof.ovh.net/files/10Mb.dat' : 'https://proof.ovh.net/files/1Mb.dat';
+  }
+
+  /**
+   * 并发下载：conns 个连接同时拉同一 URL，汇总字节数，墙钟取最慢一枪。
+   * 返回 [总字节, 墙钟毫秒]。用于 Speedtest 式多连接吞吐测量。
+   */
+  private async parallelDownload(url: string, conns: number, timeoutMs: number): Promise<number[]> {
+    const started: number = Date.now();
+    const workers: Promise<number[]>[] = [];
+    for (let i = 0; i < conns; i++) {
+      workers.push(this.httpGetBytes(url, timeoutMs));
+    }
+    const results: number[][] = await Promise.all(workers);
+    let total: number = 0;
+    let maxMs: number = 0;
+    results.forEach((r: number[]) => {
+      total = total + r[0];
+      if (r[1] > maxMs) {
+        maxMs = r[1];
+      }
+    });
+    const wall: number = Math.max(maxMs, Date.now() - started);
+    return [total, wall];
   }
 
   private async pickSpeedIndex(): Promise<number> {
@@ -1855,6 +1878,9 @@ struct Index {
     this.speedBusy = true;
     this.speedInfo = '测速中…';
     FileStore.appendLog(this.filesDir, 'speedtest start: ' + name);
+    if (!this.speedEligible(this.profiles[idx])) {
+      FileStore.appendLog(this.filesDir, 'speedtest warn: ' + name + ' 延迟不通，结果可能不准');
+    }
     try {
       const ti: number = await this.pickSpeedIndex();
       if (ti < 0) {
@@ -1863,7 +1889,15 @@ struct Index {
       }
       // 预热：先把 TCP/TLS 慢启动跑掉，这一枪不计时
       await this.httpGetBytes(SPEED_PROBES[ti], 12000);
-      let got: number[] = await this.httpGetBytes(this.speedTestUrl(ti), 20000);
+      let got: number[];
+      if (ti === 0) {
+        // Cloudflare 端点支持 bytes 参数：4 连接各取 1/4，总流量与单连接相当，
+        // 多连接并发吞吐更接近 Speedtest 式实测；固定文件端点不支持分片，退回单连接
+        const per: number = Math.max(102400, Math.floor(this.settings.speedBytes / 4));
+        got = await this.parallelDownload(this.speedTestUrl(ti, per), 4, 20000);
+      } else {
+        got = await this.httpGetBytes(this.speedTestUrl(ti), 20000);
+      }
       if (got[0] <= 0) {
         // 大文件超时（慢节点下 5MB 可能读不完）：退回小文件计时，宁可精度低也别没结果
         got = await this.httpGetBytes(SPEED_PROBES[ti], 12000);
@@ -1892,6 +1926,14 @@ struct Index {
     } finally {
       this.speedBusy = false;
     }
+  }
+
+  /**
+   * 是否适合进入下载测速：延迟测速已跑过且不通（-1）的节点默认排除，
+   * 避免在死节点上白跑大文件下载。手动单点测速仍可强制发起。
+   */
+  private speedEligible(p: Profile): boolean {
+    return !(p.delayTested && p.delay < 0);
   }
 
   /** 下载速率文案：>= 1024KB/s 换成 MB/s */
