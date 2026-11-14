@@ -4612,47 +4612,44 @@ struct Index {
       .margin({ top: 10 })
     } else {
       Column() {
-        Row({ space: 7 }) {
+        Row({ space: 6 }) {
           Text(row.groupOpen ? '▾' : '▸')
-            .fontSize(24)
+            .fontSize(20)
             .fontColor('#2E2E2E')
             .height(34)
-            .width(30)
+            .width(24)
             .textAlign(TextAlign.Center)
             .onClick(() => {
               this.toggleKey(row.groupKey);
             })
           Text(row.groupTitle)
-            .fontSize(17)
+            .fontSize(16)
             .fontWeight(FontWeight.Medium)
             .fontColor('#2E2E2E')
             .layoutWeight(1)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .maxFontScale(1)
             .onClick(() => {
               this.toggleKey(row.groupKey);
             })
-          if (this.sortByDelay && row.groupCount > 1) {
-            Text('↓')
-              .fontSize(15)
-              .fontColor('#2E7D32')
-          }
-          Text(String(row.groupCount) + ' 个')
-            .fontSize(13)
-            .fontColor('#5F6B7A')
+          Text((this.sortByDelay && row.groupCount > 1 ? '↓ ' : '') +
+            String(row.groupCount) + ' 个')
+            .fontSize(12)
+            .fontColor(this.sortByDelay && row.groupCount > 1 ? '#2E7D32' : '#5F6B7A')
             .onClick(() => {
               this.toggleKey(row.groupKey);
             })
 
           // 改名：铅笔（描边轮廓 + 笔尖分界线）
           Row() {
-            Image($r('app.media.ic_pencil')).width(20).height(20).objectFit(ImageFit.Contain)
+            Image($r('app.media.ic_pencil')).width(18).height(18).objectFit(ImageFit.Contain)
           }
-          .width(36)
-          .height(36)
+          .width(32)
+          .height(32)
           .justifyContent(FlexAlign.Center)
           .backgroundColor('#F1F5FF')
-          .borderRadius(18)
+          .borderRadius(16)
           .border({ width: 1, color: '#DCE7FF' })
           .onClick(() => {
             this.openRename(row.groupKey);
@@ -4660,13 +4657,13 @@ struct Index {
 
           // 更新：半圆箭头
           Row() {
-            Image($r('app.media.ic_refresh')).width(20).height(20).objectFit(ImageFit.Contain)
+            Image($r('app.media.ic_refresh')).width(18).height(18).objectFit(ImageFit.Contain)
           }
-          .width(36)
-          .height(36)
+          .width(32)
+          .height(32)
           .justifyContent(FlexAlign.Center)
           .backgroundColor('#F1F5FF')
-          .borderRadius(18)
+          .borderRadius(16)
           .border({ width: 1, color: '#DCE7FF' })
           .onClick(() => {
             this.refreshGroup(row.groupKey);
@@ -4674,13 +4671,13 @@ struct Index {
 
           // 测速：闪电
           Row() {
-            Image($r('app.media.ic_bolt')).width(20).height(20).objectFit(ImageFit.Contain)
+            Image($r('app.media.ic_bolt')).width(18).height(18).objectFit(ImageFit.Contain)
           }
-          .width(36)
-          .height(36)
+          .width(32)
+          .height(32)
           .justifyContent(FlexAlign.Center)
           .backgroundColor('#D8E6FF')
-          .borderRadius(18)
+          .borderRadius(16)
           .border({ width: 1, color: '#C2D8FF' })
           .onClick(() => {
             this.testGroupByKey(row.groupKey);
@@ -4688,13 +4685,13 @@ struct Index {
 
           // 删除整组：红色 ✕，先弹确认再删
           Row() {
-            Text('✕').fontSize(18).fontColor('#C62828')
+            Text('✕').fontSize(16).fontColor('#C62828')
           }
-          .width(36)
-          .height(36)
+          .width(32)
+          .height(32)
           .justifyContent(FlexAlign.Center)
           .backgroundColor('#FDECEA')
-          .borderRadius(18)
+          .borderRadius(16)
           .border({ width: 1, color: '#F5C6C2' })
           .onClick(() => {
             this.deleteGroup(row.groupKey);
@@ -6026,25 +6023,29 @@ struct Index {
         .width('100%')
         .alignItems(HorizontalAlign.Start)
 
-        Row({ space: 10 }) {
-          Button('添加节点').layoutWeight(1).height(38).fontSize(14)
+        Row({ space: 8 }) {
+          Button('添加节点').layoutWeight(1).height(38).fontSize(13)
+            .padding({ left: 2, right: 2 })
             .backgroundColor('#F0F0F0').fontColor('#333333')
             .onClick(() => {
               this.addNew();
             })
-          Button(this.updatingAll ? '更新中…' : '全部更新').layoutWeight(1).height(38).fontSize(14)
+          Button(this.updatingAll ? '更新中…' : '全部更新').layoutWeight(1).height(38).fontSize(13)
+            .padding({ left: 2, right: 2 })
             .backgroundColor('#F0F0F0').fontColor('#333333')
             .enabled(!this.updatingAll && !this.testing)
             .onClick(() => {
               this.updateAllSubscriptions();
             })
-          Button(this.testing ? '测速中…' : '全部测速').layoutWeight(1).height(38).fontSize(14)
+          Button(this.testing ? '测速中…' : '全部测速').layoutWeight(1).height(38).fontSize(13)
+            .padding({ left: 2, right: 2 })
             .backgroundColor('#F0F0F0').fontColor('#333333')
             .enabled(!this.testing && !this.updatingAll)
             .onClick(() => {
               this.testAll();
             })
-          Button(this.multiMode ? '退出多选' : '多选').layoutWeight(1).height(38).fontSize(14)
+          Button(this.multiMode ? '退出多选' : '多选').layoutWeight(1).height(38).fontSize(13)
+            .padding({ left: 2, right: 2 })
             .backgroundColor(this.multiMode ? '#DCE7FF' : '#F0F0F0')
             .fontColor('#0A59F7')
             .enabled(!this.testing)
