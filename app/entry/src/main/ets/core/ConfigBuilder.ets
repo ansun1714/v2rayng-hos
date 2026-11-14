@@ -338,6 +338,44 @@ export class ConfigBuilder {
       }
     } else if (profile.type === 'trojan') {
       lines.push('    password: ' + ConfigBuilder.quote(profile.password));
+    } else if (profile.type === 'hysteria2') {
+      lines.push('    password: ' + ConfigBuilder.quote(profile.password));
+      if (profile.hy2Up.length > 0) {
+        lines.push('    up: ' + ConfigBuilder.quote(profile.hy2Up));
+      }
+      if (profile.hy2Down.length > 0) {
+        lines.push('    down: ' + ConfigBuilder.quote(profile.hy2Down));
+      }
+      if (profile.hy2Obfs.length > 0) {
+        lines.push('    obfs: ' + ConfigBuilder.quote(profile.hy2Obfs));
+      }
+      if (profile.hy2ObfsPassword.length > 0) {
+        lines.push('    obfs-password: ' + ConfigBuilder.quote(profile.hy2ObfsPassword));
+      }
+    } else if (profile.type === 'tuic') {
+      if (profile.uuid.length > 0) {
+        lines.push('    uuid: ' + ConfigBuilder.quote(profile.uuid));
+      }
+      if (profile.password.length > 0) {
+        lines.push('    password: ' + ConfigBuilder.quote(profile.password));
+      }
+      if (profile.tuicCongestion.length > 0) {
+        lines.push('    congestion-controller: ' + ConfigBuilder.quote(profile.tuicCongestion));
+      }
+      if (profile.tuicUdpMode.length > 0) {
+        lines.push('    udp-relay-mode: ' + ConfigBuilder.quote(profile.tuicUdpMode));
+      }
+      if (profile.tuicReduceRtt) {
+        lines.push('    reduce-rtt: true');
+      }
+      if (profile.tuicFastOpen) {
+        lines.push('    fast-open: true');
+      }
+    } else if (profile.type === 'anytls') {
+      lines.push('    password: ' + ConfigBuilder.quote(profile.password));
+      if (profile.anytlsMetadata.length > 0) {
+        lines.push('    client-metadata: ' + ConfigBuilder.quote(profile.anytlsMetadata));
+      }
     } else if (profile.type === 'ss') {
       lines.push('    cipher: ' + ConfigBuilder.quote(profile.cipher));
       lines.push('    password: ' + ConfigBuilder.quote(profile.password));
@@ -410,7 +448,31 @@ export class ConfigBuilder {
     }
     }
 
-    if (profile.tls) {
+    const specialTls: boolean = profile.type === 'hysteria2'
+      || profile.type === 'tuic' || profile.type === 'anytls';
+    if (specialTls) {
+      // hy2/tuic/anytls 内部走 TLS，但 mihomo 出站不接受 tls: true/servername，
+      // SNI/ALPN/指纹/证书校验直接写在出站顶层。
+      if (profile.sni.length > 0) {
+        lines.push('    sni: ' + ConfigBuilder.quote(profile.sni));
+      }
+      if (profile.fingerprint.length > 0) {
+        // anytls 的浏览器指纹走 client-fingerprint；hy2/tuic 此版本无该选项，跳过。
+        if (profile.type === 'anytls') {
+          lines.push('    client-fingerprint: ' + ConfigBuilder.quote(profile.fingerprint));
+        }
+      }
+      if (profile.alpn.length > 0) {
+        const alpnItems: string[] = profile.alpn.split(',').map((a: string) => a.trim())
+          .filter((a: string) => a.length > 0);
+        if (alpnItems.length > 0) {
+          lines.push('    alpn: [' + alpnItems.map((a: string) => ConfigBuilder.quote(a)).join(', ') + ']');
+        }
+      }
+      if (profile.allowInsecure === true) {
+        lines.push('    skip-cert-verify: true');
+      }
+    } else if (profile.tls) {
       lines.push('    tls: true');
       if (profile.sni.length > 0) {
         lines.push('    servername: ' + ConfigBuilder.quote(profile.sni));

@@ -26,6 +26,15 @@ export class ProxySpec {
   kcpSeed: string = '';    // mkcp/kcp 传输的 seed
   kcpHeader: string = '';  // mkcp/kcp 伪装类型（headerType，如 srtp/utp/wechat-video）
   xhttpMode: string = '';  // xhttp 模式（auto/stream-one/stream-up 等）
+  hy2Obfs: string = '';     // hysteria2 混淆类型（如 salamander）
+  hy2ObfsPassword: string = ''; // hysteria2 混淆密码
+  hy2Up: string = '';       // hysteria2 上行带宽（如 50 Mbps）
+  hy2Down: string = '';     // hysteria2 下行带宽（如 200 Mbps）
+  tuicCongestion: string = '';  // tuic 拥塞控制（bbr/cubic/newreno）
+  tuicUdpMode: string = '';     // tuic UDP 中继模式（native/quic）
+  tuicReduceRtt: boolean = false;
+  tuicFastOpen: boolean = false;
+  anytlsMetadata: string = '';  // anytls client-metadata
   link: string = '';
 }
 
@@ -59,6 +68,15 @@ export class Profile {
   kcpSeed: string = '';
   kcpHeader: string = '';
   xhttpMode: string = '';
+  hy2Obfs: string = '';
+  hy2ObfsPassword: string = '';
+  hy2Up: string = '';
+  hy2Down: string = '';
+  tuicCongestion: string = '';
+  tuicUdpMode: string = '';
+  tuicReduceRtt: boolean = false;
+  tuicFastOpen: boolean = false;
+  anytlsMetadata: string = '';
   delay: number = -1;   // 测速结果（毫秒），-1 未测/不通
   /** 延迟测速是否跑过：未测显示「—」，测过不通才显示红色 -1 */
   delayTested: boolean = false;

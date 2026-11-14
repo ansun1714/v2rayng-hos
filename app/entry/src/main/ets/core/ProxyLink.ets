@@ -65,6 +65,15 @@ export class ProxyLink {
     p.kcpSeed = spec.kcpSeed;
     p.kcpHeader = spec.kcpHeader;
     p.xhttpMode = spec.xhttpMode;
+    p.hy2Obfs = spec.hy2Obfs;
+    p.hy2ObfsPassword = spec.hy2ObfsPassword;
+    p.hy2Up = spec.hy2Up;
+    p.hy2Down = spec.hy2Down;
+    p.tuicCongestion = spec.tuicCongestion;
+    p.tuicUdpMode = spec.tuicUdpMode;
+    p.tuicReduceRtt = spec.tuicReduceRtt;
+    p.tuicFastOpen = spec.tuicFastOpen;
+    p.anytlsMetadata = spec.anytlsMetadata;
     p.subId = subId;
     return p;
   }
@@ -79,6 +88,15 @@ export class ProxyLink {
     }
     if (text.startsWith('trojan://')) {
       return ProxyLink.parseTrojan(text);
+    }
+    if (text.startsWith('hysteria2://') || text.startsWith('hy2://')) {
+      return ProxyLink.parseHy2(text);
+    }
+    if (text.startsWith('tuic://')) {
+      return ProxyLink.parseTuic(text);
+    }
+    if (text.startsWith('anytls://')) {
+      return ProxyLink.parseAnytls(text);
     }
     if (text.startsWith('ss://')) {
       return ProxyLink.parseSs(text);
@@ -210,6 +228,48 @@ export class ProxyLink {
     if (insecure !== undefined) {
       spec.allowInsecure = insecure === '1' || insecure.toLowerCase() === 'true';
     }
+    const obfs: string | undefined = parts.query.get('obfs');
+    if (obfs !== undefined) {
+      spec.hy2Obfs = obfs;
+    }
+    const obfsPassword: string | undefined = parts.query.get('obfs-password')
+      ?? parts.query.get('obfsPassword');
+    if (obfsPassword !== undefined) {
+      spec.hy2ObfsPassword = obfsPassword;
+    }
+    const up: string | undefined = parts.query.get('up');
+    if (up !== undefined) {
+      spec.hy2Up = up;
+    }
+    const down: string | undefined = parts.query.get('down');
+    if (down !== undefined) {
+      spec.hy2Down = down;
+    }
+    const congestion: string | undefined = parts.query.get('congestion-controller')
+      ?? parts.query.get('congestion');
+    if (congestion !== undefined) {
+      spec.tuicCongestion = congestion;
+    }
+    const udpMode: string | undefined = parts.query.get('udp-relay-mode')
+      ?? parts.query.get('udpRelayMode');
+    if (udpMode !== undefined) {
+      spec.tuicUdpMode = udpMode;
+    }
+    const reduceRtt: string | undefined = parts.query.get('reduce-rtt')
+      ?? parts.query.get('reduceRtt');
+    if (reduceRtt !== undefined) {
+      spec.tuicReduceRtt = reduceRtt === '1' || reduceRtt.toLowerCase() === 'true';
+    }
+    const fastOpen: string | undefined = parts.query.get('fast-open')
+      ?? parts.query.get('fastOpen');
+    if (fastOpen !== undefined) {
+      spec.tuicFastOpen = fastOpen === '1' || fastOpen.toLowerCase() === 'true';
+    }
+    const metadata: string | undefined = parts.query.get('client-metadata')
+      ?? parts.query.get('metadata');
+    if (metadata !== undefined) {
+      spec.anytlsMetadata = metadata;
+    }
   }
 
   static parseVmess(link: string): ProxySpec {
@@ -265,6 +325,67 @@ export class ProxyLink {
       throw new Error('trojan 链接格式错误');
     }
     spec.type = 'trojan';
+    spec.server = parts.host;
+    spec.port = parts.port;
+    spec.password = parts.userinfo;
+    spec.tls = true;
+    ProxyLink.applyQuery(spec, parts);
+    spec.name = parts.name.length > 0 ? parts.name : (spec.server + ':' + spec.port);
+    spec.link = link;
+    return spec;
+  }
+
+  /** hysteria2:// / hy2://，userinfo 为密码。 */
+  static parseHy2(link: string): ProxySpec {
+    const spec = new ProxySpec();
+    const scheme: string = link.toLowerCase().startsWith('hysteria2://') ? 'hysteria2' : 'hy2';
+    const parts: UriParts = ProxyLink.splitUri(link, scheme);
+    if (!parts.valid) {
+      throw new Error('hysteria2 链接格式错误');
+    }
+    spec.type = 'hysteria2';
+    spec.server = parts.host;
+    spec.port = parts.port;
+    spec.password = parts.userinfo;
+    spec.tls = true;
+    ProxyLink.applyQuery(spec, parts);
+    spec.name = parts.name.length > 0 ? parts.name : (spec.server + ':' + spec.port);
+    spec.link = link;
+    return spec;
+  }
+
+  /** tuic://，userinfo 为 uuid:password（或仅 token）。 */
+  static parseTuic(link: string): ProxySpec {
+    const spec = new ProxySpec();
+    const parts: UriParts = ProxyLink.splitUri(link, 'tuic');
+    if (!parts.valid) {
+      throw new Error('tuic 链接格式错误');
+    }
+    spec.type = 'tuic';
+    spec.server = parts.host;
+    spec.port = parts.port;
+    const colon: number = parts.userinfo.indexOf(':');
+    if (colon >= 0) {
+      spec.uuid = parts.userinfo.substring(0, colon);
+      spec.password = parts.userinfo.substring(colon + 1);
+    } else {
+      spec.password = parts.userinfo;
+    }
+    spec.tls = true;
+    ProxyLink.applyQuery(spec, parts);
+    spec.name = parts.name.length > 0 ? parts.name : (spec.server + ':' + spec.port);
+    spec.link = link;
+    return spec;
+  }
+
+  /** anytls://，userinfo 为密码。 */
+  static parseAnytls(link: string): ProxySpec {
+    const spec = new ProxySpec();
+    const parts: UriParts = ProxyLink.splitUri(link, 'anytls');
+    if (!parts.valid) {
+      throw new Error('anytls 链接格式错误');
+    }
+    spec.type = 'anytls';
     spec.server = parts.host;
     spec.port = parts.port;
     spec.password = parts.userinfo;
@@ -439,6 +560,65 @@ export class ProxyLink {
         : encodeURIComponent(p.password);
       const scheme: string = p.type === 'http' ? (p.tls ? 'https' : 'http') : 'socks5';
       return scheme + '://' + cred + '@' + p.server + ':' + String(p.port) + '#' + name;
+    }
+    if (p.type === 'hysteria2') {
+      if (p.link.length > 0 && p.link.startsWith('hysteria2://')) {
+        return p.link;
+      }
+      const q: string[] = [];
+      const add = (k: string, v: string): void => {
+        if (v.length > 0) { q.push(k + '=' + encodeURIComponent(v)); }
+      };
+      add('obfs', p.hy2Obfs);
+      add('obfs-password', p.hy2ObfsPassword);
+      add('sni', p.sni);
+      add('alpn', p.alpn);
+      add('up', p.hy2Up);
+      add('down', p.hy2Down);
+      add('fp', p.fingerprint);
+      if (p.allowInsecure) { q.push('allowInsecure=1'); }
+      const qs: string = q.length > 0 ? '?' + q.join('&') : '';
+      return 'hysteria2://' + encodeURIComponent(p.password) + '@' + p.server + ':' +
+        String(p.port) + qs + '#' + name;
+    }
+    if (p.type === 'tuic') {
+      if (p.link.length > 0 && p.link.startsWith('tuic://')) {
+        return p.link;
+      }
+      const q: string[] = [];
+      const add = (k: string, v: string): void => {
+        if (v.length > 0) { q.push(k + '=' + encodeURIComponent(v)); }
+      };
+      add('sni', p.sni);
+      add('alpn', p.alpn);
+      add('congestion-controller', p.tuicCongestion);
+      add('udp-relay-mode', p.tuicUdpMode);
+      if (p.tuicReduceRtt) { q.push('reduce-rtt=1'); }
+      if (p.tuicFastOpen) { q.push('fast-open=1'); }
+      add('fp', p.fingerprint);
+      if (p.allowInsecure) { q.push('allowInsecure=1'); }
+      const qs: string = q.length > 0 ? '?' + q.join('&') : '';
+      const cred: string = p.uuid.length > 0
+        ? encodeURIComponent(p.uuid) + ':' + encodeURIComponent(p.password)
+        : encodeURIComponent(p.password);
+      return 'tuic://' + cred + '@' + p.server + ':' + String(p.port) + qs + '#' + name;
+    }
+    if (p.type === 'anytls') {
+      if (p.link.length > 0 && p.link.startsWith('anytls://')) {
+        return p.link;
+      }
+      const q: string[] = [];
+      const add = (k: string, v: string): void => {
+        if (v.length > 0) { q.push(k + '=' + encodeURIComponent(v)); }
+      };
+      add('sni', p.sni);
+      add('alpn', p.alpn);
+      add('client-metadata', p.anytlsMetadata);
+      add('fp', p.fingerprint);
+      if (p.allowInsecure) { q.push('allowInsecure=1'); }
+      const qs: string = q.length > 0 ? '?' + q.join('&') : '';
+      return 'anytls://' + encodeURIComponent(p.password) + '@' + p.server + ':' +
+        String(p.port) + qs + '#' + name;
     }
     // vless（默认）
     return 'vless://' + encodeURIComponent(p.uuid) + '@' + p.server + ':' +
