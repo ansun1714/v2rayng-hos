@@ -4825,131 +4825,17 @@ struct Index {
           .fontSize(13)
           .fontColor('#5A5A5A')
 
-        Button('设置 · 测速选项')
+        Button('设置')
           .width('100%')
           .height(44)
           .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
+          .backgroundColor('#EAF1FF')
+          .fontColor('#0A59F7')
           .onClick(() => {
             this.openSettings();
           })
 
-        Button('设置 · 分应用代理')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.openAppScope();
-          })
-
-        Button('设置 · 分流规则')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.openRules();
-          })
-
-        Button('设置 · Geo 资源')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.openGeo();
-          })
-
-        Button('新建分组')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.openNewGroup();
-          })
-
-        Button('查看运行日志')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.openLogs();
-          })
-
-        Button('清除运行日志')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.clearRunLog();
-          })
-
-        Text('运行日志只存在本机应用目录，记录连接状态与出口探测结果，保留最近 240 行。')
-          .fontSize(13)
-          .fontColor('#5A5A5A')
-
-        Text('备份与还原')
-          .fontSize(15)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#333333')
-          .margin({ top: 12 })
-
-        Button('导出全量备份')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.exportBackupToFile();
-          })
-
-        Button('从备份文件还原')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.importBackupFromFile();
-          })
-
-        Button('还原本机快照')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#F0F0F0')
-          .fontColor('#333333')
-          .onClick(() => {
-            this.restoreLocalSnapshot();
-          })
-
-        Text('备份含节点、分组名、配额、分流规则、分应用名单与测速偏好；换机或重装后可直接还原。')
-          .fontSize(13)
-          .fontColor('#5A5A5A')
-
-        Button('清空全部节点')
-          .width('100%')
-          .height(44)
-          .fontSize(15)
-          .backgroundColor('#FDECEA')
-          .fontColor('#C62828')
-          .onClick(() => {
-            this.clearAllProfiles();
-          })
-
-        Text('清空后全部节点与订阅分组都会被删除，分流规则和分应用名单保留。')
+        Text('测速选项、连接行为、分应用代理、分流规则、Geo 资源、分组、日志、备份还原、清空节点都在设置页里。')
           .fontSize(13)
           .fontColor('#5A5A5A')
 
@@ -5117,7 +5003,7 @@ struct Index {
 
   @Builder
   settingsPanelView() {
-    Column({ space: 12 }) {
+    Column({ space: 10 }) {
       Row({ space: 8 }) {
         Button('返回')
           .width(76)
@@ -5128,7 +5014,7 @@ struct Index {
           .onClick(() => {
             this.settingsPanel = false;
           })
-        Text('测速选项')
+        Text('设置')
           .fontSize(19)
           .fontWeight(FontWeight.Bold)
           .layoutWeight(1)
@@ -5144,51 +5030,149 @@ struct Index {
       }
       .width('100%')
 
-      Text('延迟测速并发：同时发起的测速请求数。并发太高可能被节点限流，太低则整组测速慢。')
-        .fontSize(13)
-        .fontColor('#5A5A5A')
-      Row({ space: 8 }) {
-        this.chip('6', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 6 }); })
-        this.chip('12', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 12 }); })
-        this.chip('24', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 24 }); })
+      Scroll() {
+        Column({ space: 6 }) {
+          // ---- 测速 ----
+          this.settingSection('测速')
+          Text('延迟测速并发：同时发起的测速请求数。并发太高可能被节点限流，太低则整组测速慢。')
+            .fontSize(13)
+            .fontColor('#5A5A5A')
+            .width('100%')
+          Row({ space: 8 }) {
+            this.chip('6', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 6 }); })
+            this.chip('12', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 12 }); })
+            this.chip('24', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 24 }); })
+          }
+          .width('100%')
+
+          Text('带宽测速包大小：下载文件越大测速越准；慢节点建议选小一档，避免大文件读不完超时。')
+            .fontSize(13)
+            .fontColor('#5A5A5A')
+            .width('100%')
+          Row({ space: 8 }) {
+            this.chip('1 MB', this.settings.speedBytes === 1048576 ? '1 MB' : '', () => { this.patchSettings({ speedBytes: 1048576 }); })
+            this.chip('5 MB', this.settings.speedBytes === 5242880 ? '5 MB' : '', () => { this.patchSettings({ speedBytes: 5242880 }); })
+            this.chip('10 MB', this.settings.speedBytes === 10485760 ? '10 MB' : '', () => { this.patchSettings({ speedBytes: 10485760 }); })
+          }
+          .width('100%')
+
+          // ---- 连接行为 ----
+          this.settingSection('连接行为')
+          this.toggleRow('自动连接', '冷启动 / 掉线后自动重连', this.settings.autoConnect,
+            (v: boolean) => { this.patchSettings({ autoConnect: v }); })
+          this.toggleRow('故障转移', '当前节点无流量时自动切换到其他可用节点', this.settings.failover,
+            (v: boolean) => { this.patchSettings({ failover: v }); })
+          this.toggleRow('后台保活', '连接期间申请长时任务，降低后台被系统回收的概率', this.settings.keepAlive,
+            (v: boolean) => { this.patchSettings({ keepAlive: v }); })
+
+          // ---- 订阅 ----
+          this.settingSection('订阅')
+          this.toggleRow('启动时自动更新', '打开应用后静默更新所有带链接的订阅分组', this.settings.autoUpdateOnStart,
+            (v: boolean) => { this.patchSettings({ autoUpdateOnStart: v }); })
+
+          // ---- 代理与分流 ----
+          this.settingSection('代理与分流')
+          this.settingEntry('分应用代理', '全部走代理 / 仅白名单 / 排除黑名单，手动填包名', false,
+            () => { this.openAppScope(); })
+          this.settingEntry('分流规则', '逐条编辑规则，可从网址更新规则集并导出/导入 JSON', false,
+            () => { this.openRules(); })
+          this.settingEntry('Geo 资源', '查看 geoip/geosite 大小与时间，在线更新或本地文件替换', false,
+            () => { this.openGeo(); })
+
+          // ---- 节点与分组 ----
+          this.settingSection('节点与分组')
+          this.settingEntry('新建分组', '名称 + 订阅链接；链接留空则建手动分组', false,
+            () => { this.openNewGroup(); })
+
+          // ---- 运行日志 ----
+          this.settingSection('运行日志')
+          this.settingEntry('查看运行日志', '界面 / VPN / 看门狗三通道，各保留最近 240 行', false,
+            () => { this.openLogs(); })
+          this.settingEntry('清除运行日志', '删除三条通道的日志文件', false,
+            () => { this.clearRunLog(); })
+
+          // ---- 备份与还原 ----
+          this.settingSection('备份与还原')
+          this.settingEntry('导出全量备份', '节点、分组名、配额、规则、分应用名单与测速偏好', false,
+            () => { this.exportBackupToFile(); })
+          this.settingEntry('从备份文件还原', '选择备份 JSON 覆盖当前配置', false,
+            () => { this.importBackupFromFile(); })
+          this.settingEntry('还原本机快照', '回滚到上次本机自动保存的快照', false,
+            () => { this.restoreLocalSnapshot(); })
+
+          // ---- 危险操作 ----
+          this.settingSection('危险操作')
+          this.settingEntry('清空全部节点', '删除全部节点与订阅分组；分流规则与分应用名单保留', true,
+            () => { this.clearAllProfiles(); })
+
+          // ---- 关于 ----
+          this.settingSection('关于')
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text('内核版本').fontSize(15).fontColor('#1A1A1A')
+              Text('mihomo 单内核').fontSize(12).fontColor('#5A5A5A')
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Text(this.coreVersion.length > 0 ? this.coreVersion : '—')
+              .fontSize(14)
+              .fontColor('#5A5A5A')
+          }
+          .width('100%')
+          .padding({ top: 10, bottom: 10, left: 12, right: 12 })
+          .borderRadius(10)
+          .backgroundColor('#F7F8FA')
+
+          Blank().height(8)
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
       }
-      .width('100%')
-
-      Text('带宽测速包大小：下载文件越大测速越准；慢节点建议选小一档，避免大文件读不完超时。')
-        .fontSize(13)
-        .fontColor('#5A5A5A')
-      Row({ space: 8 }) {
-        this.chip('1 MB', this.settings.speedBytes === 1048576 ? '1 MB' : '', () => { this.patchSettings({ speedBytes: 1048576 }); })
-        this.chip('5 MB', this.settings.speedBytes === 5242880 ? '5 MB' : '', () => { this.patchSettings({ speedBytes: 5242880 }); })
-        this.chip('10 MB', this.settings.speedBytes === 10485760 ? '10 MB' : '', () => { this.patchSettings({ speedBytes: 10485760 }); })
-      }
-      .width('100%')
-
-      Divider().margin({ top: 8, bottom: 4 })
-      Text('连接行为')
-        .fontSize(15)
-        .fontWeight(FontWeight.Bold)
-      this.toggleRow('自动连接', '冷启动 / 掉线后自动重连', this.settings.autoConnect,
-        (v: boolean) => { this.patchSettings({ autoConnect: v }); })
-      this.toggleRow('故障转移', '当前节点无流量时自动切换到其他可用节点', this.settings.failover,
-        (v: boolean) => { this.patchSettings({ failover: v }); })
-      this.toggleRow('后台保活', '连接期间申请长时任务，降低后台被系统回收的概率', this.settings.keepAlive,
-        (v: boolean) => { this.patchSettings({ keepAlive: v }); })
-
-      Divider().margin({ top: 8, bottom: 4 })
-      Text('订阅')
-        .fontSize(15)
-        .fontWeight(FontWeight.Bold)
-      this.toggleRow('启动时自动更新', '打开应用后静默更新所有带链接的订阅分组', this.settings.autoUpdateOnStart,
-        (v: boolean) => { this.patchSettings({ autoUpdateOnStart: v }); })
-
-      Blank()
+      .layoutWeight(1)
+      .align(Alignment.Top)
     }
     .width('100%')
     .height('100%')
     .padding(16)
     .backgroundColor('#FFFFFF')
     .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 设置页分区标题。 */
+  @Builder
+  settingSection(title: string) {
+    Text(title)
+      .fontSize(15)
+      .fontWeight(FontWeight.Bold)
+      .fontColor('#1A1A1A')
+      .width('100%')
+      .margin({ top: 14, bottom: 2 })
+  }
+
+  /** 设置页入口行：标题 + 说明 + 右侧箭头，点击进入子面板。 */
+  @Builder
+  settingEntry(title: string, desc: string, danger: boolean, onTap: () => void) {
+    Row({ space: 10 }) {
+      Column({ space: 2 }) {
+        Text(title).fontSize(15).fontColor(danger ? '#C62828' : '#1A1A1A')
+        if (desc.length > 0) {
+          Text(desc).fontSize(12).fontColor('#5A5A5A')
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      Text('›')
+        .fontSize(18)
+        .fontColor('#9A9A9A')
+    }
+    .width('100%')
+    .padding({ top: 10, bottom: 10, left: 12, right: 12 })
+    .borderRadius(10)
+    .backgroundColor('#F7F8FA')
+    .onClick(() => {
+      onTap();
+    })
   }
 
   /** 设置页开关行：标题 + 说明 + 右侧 Switch。 */
