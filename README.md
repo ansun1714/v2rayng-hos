@@ -6,7 +6,7 @@
 > **非官方项目。** 本项目与 v2rayNG、mihomo 项目及其作者没有隶属关系，是个人在鸿蒙平台上的一次移植实践，
 > 借用的是它们的设计思路、内核与协议实现。上游致谢见 [CREDITS.md](CREDITS.md)。
 
-[![build-unsigned-hap](https://github.com/ansun1714/v2rayng-hos/actions/workflows/build-hap.yml/badge.svg)](https://github.com/ansun1714/v2rayng-hos/actions/workflows/build-hap.yml)
+[![build-unsigned-hap](https://github.com/ansun1714/v2raym-hos/actions/workflows/build-hap.yml/badge.svg)](https://github.com/ansun1714/v2raym-hos/actions/workflows/build-hap.yml)
 
 ## 界面
 
@@ -134,7 +134,7 @@ tools/                          命令行构建脚本
 
 - **下载位置**：两种都行
   - Releases 页（推荐）：每次 push 构建成功后由 Actions 自动发布到
-    `https://github.com/ansun1714/v2rayng-hos/releases/tag/hap-latest`，
+    `https://github.com/ansun1714/v2raym-hos/releases/tag/hap-latest`，
     资产固定叫 `entry-default-unsigned.hap`，正文里有大小、SHA256 与对应 run
   - Actions 对应 run 的页面 → Artifacts → `v2raym-ohos-unsigned-hap-api15`（保留 30 天，同一份产物打成 zip）
   - Release 里的 `hvigor-5.19.8` 是 **prerelease**，只放 CI 需要的 hvigor tarball，不是应用成品

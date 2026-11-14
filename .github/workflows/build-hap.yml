@@ -27,7 +27,7 @@ jobs:
       HVIGOR_VER: "5.19.8"
       # @ohos/hvigor 与 @ohos/hvigor-ohos-plugin 只发布在华为源，境外 runner 拉取不稳，
       # 故把这两个自包含 tarball 镜像到本仓库的 Release（见 tag hvigor-5.19.8）。
-      HVIGOR_RELEASE_BASE: https://github.com/ansun1714/v2rayng-hos/releases/download/hvigor-5.19.8
+      HVIGOR_RELEASE_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download/hvigor-5.19.8
 
     steps:
       - name: Checkout
