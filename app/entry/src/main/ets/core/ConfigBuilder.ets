@@ -399,6 +399,12 @@ export class ConfigBuilder {
         lines.push('      headers:');
         lines.push('        Host: ' + ConfigBuilder.quote(profile.wsHost));
       }
+      if (profile.httpUpgrade) {
+        lines.push('      v2ray-http-upgrade: true');
+      }
+      if (profile.httpUpgradeFastOpen) {
+        lines.push('      v2ray-http-upgrade-fast-open: true');
+      }
     } else if (profile.network === 'grpc') {
       lines.push('    network: grpc');
       lines.push('    grpc-opts:');

@@ -35,6 +35,8 @@ export class ProxySpec {
   tuicReduceRtt: boolean = false;
   tuicFastOpen: boolean = false;
   anytlsMetadata: string = '';  // anytls client-metadata
+  httpUpgrade: boolean = false;       // ws 的 v2ray-http-upgrade（链接 type=httpupgrade）
+  httpUpgradeFastOpen: boolean = false;
   link: string = '';
 }
 
@@ -77,6 +79,8 @@ export class Profile {
   tuicReduceRtt: boolean = false;
   tuicFastOpen: boolean = false;
   anytlsMetadata: string = '';
+  httpUpgrade: boolean = false;
+  httpUpgradeFastOpen: boolean = false;
   delay: number = -1;   // 测速结果（毫秒），-1 未测/不通
   /** 延迟测速是否跑过：未测显示「—」，测过不通才显示红色 -1 */
   delayTested: boolean = false;

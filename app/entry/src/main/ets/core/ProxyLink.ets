@@ -74,6 +74,8 @@ export class ProxyLink {
     p.tuicReduceRtt = spec.tuicReduceRtt;
     p.tuicFastOpen = spec.tuicFastOpen;
     p.anytlsMetadata = spec.anytlsMetadata;
+    p.httpUpgrade = spec.httpUpgrade;
+    p.httpUpgradeFastOpen = spec.httpUpgradeFastOpen;
     p.subId = subId;
     return p;
   }
@@ -168,7 +170,18 @@ export class ProxyLink {
   static applyQuery(spec: ProxySpec, parts: UriParts): void {
     const network: string | undefined = parts.query.get('type');
     if (network !== undefined && network.length > 0) {
-      spec.network = network === 'h2' ? 'h2' : network;
+      if (network === 'httpupgrade') {
+        // httpupgrade 在 mihomo 里是 ws 的 v2ray-http-upgrade 选项，不是独立 network。
+        spec.network = 'ws';
+        spec.httpUpgrade = true;
+      } else {
+        spec.network = network === 'h2' ? 'h2' : network;
+      }
+    }
+    const httpFastOpen: string | undefined = parts.query.get('fast-open')
+      ?? parts.query.get('fastOpen');
+    if (httpFastOpen !== undefined) {
+      spec.httpUpgradeFastOpen = httpFastOpen === '1' || httpFastOpen.toLowerCase() === 'true';
     }
     const security: string | undefined = parts.query.get('security');
     if (security !== undefined && (security === 'tls' || security === 'reality')) {
@@ -496,7 +509,7 @@ export class ProxyLink {
         q.push(k + '=' + encodeURIComponent(v));
       }
     };
-    add('type', p.network);
+    add('type', p.httpUpgrade ? 'httpupgrade' : p.network);
     if (p.tls) {
       add('security', p.realityPbk.length > 0 ? 'reality' : 'tls');
       add('sni', p.sni);
@@ -511,6 +524,9 @@ export class ProxyLink {
     if (p.network === 'ws') {
       add('path', p.wsPath);
       add('host', p.wsHost);
+      if (p.httpUpgradeFastOpen) {
+        q.push('fast-open=1');
+      }
     } else if (p.network === 'grpc') {
       add('serviceName', p.grpcService);
     } else if (p.network === 'mkcp' || p.network === 'kcp') {
