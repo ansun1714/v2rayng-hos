@@ -19,6 +19,7 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { connection } from '@kit.NetworkKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { FileStore } from './FileStore';
+import { AppSettings } from './Model';
 
 const BUNDLE_NAME: string = 'com.maoxu.v2rayng';
 const ENTRY_ABILITY: string = 'EntryAbility';
@@ -181,6 +182,10 @@ export class KeepAliveManager {
       this.init(ctx);
     }
     const filesDir: string = ctx.filesDir;
+    // 后台保活被用户关闭：不申请长时任务，也不进冷却/节流逻辑
+    if (this.keepAliveDisabled()) {
+      return;
+    }
     if (!this.canAutoRecover()) {
       return;
     }
@@ -303,6 +308,44 @@ export class KeepAliveManager {
   /** 冷却剩余毫秒（无冷却时为 0），供自动恢复把冷却并入回退间隔 */
   cooldownRemaining(): number {
     return Math.max(0, this.bgCooldownUntil - Date.now());
+  }
+
+  /**
+   * 读 settings.json 里的连接行为开关。字段缺失 / 文件不存在 / 解析失败一律按 true，
+   * 兼容旧版本（旧 settings.json 只有并发与包大小）。
+   */
+  private settingsFlag(name: string): boolean {
+    if (this.filesDir.length === 0) {
+      return true;
+    }
+    const text: string = FileStore.readText(FileStore.settingsPath(this.filesDir));
+    if (text.length === 0) {
+      return true;
+    }
+    try {
+      const st: AppSettings = JSON.parse(text) as AppSettings;
+      let v: boolean | undefined;
+      if (name === 'keepAlive') {
+        v = st.keepAlive;
+      } else if (name === 'autoConnect') {
+        v = st.autoConnect;
+      } else if (name === 'failover') {
+        v = st.failover;
+      }
+      return v === undefined ? true : v === true;
+    } catch (err) {
+      return true;
+    }
+  }
+
+  /** 后台保活开关是否关闭（关闭后不申请长时任务）。 */
+  keepAliveDisabled(): boolean {
+    return !this.settingsFlag('keepAlive');
+  }
+
+  /** 自动连接开关是否关闭（关闭后冷启动 / 掉线不自动重连）。 */
+  autoConnectDisabled(): boolean {
+    return !this.settingsFlag('autoConnect');
   }
 
   isUserStopped(): boolean {
@@ -431,6 +474,10 @@ export class KeepAliveManager {
    */
   requestColdStartHeal(filesDir: string): boolean {
     if (this.coldStartHealDone || !this.canAutoRecover()) {
+      return false;
+    }
+    // 自动连接被用户关闭：冷启动不登记自愈请求
+    if (this.autoConnectDisabled()) {
       return false;
     }
     if (!this.isAbnormalDisconnect(filesDir)) {

@@ -68,6 +68,27 @@ export interface AppScope {
 export interface AppSettings {
   testConcurrency: number;
   speedBytes: number;
+  /** 冷启动 / 掉线后是否自动重连（开关，默认开） */
+  autoConnect: boolean;
+  /** 节点无流量时是否允许自动故障转移（开关，默认开） */
+  failover: boolean;
+  /** 连接期间是否申请后台长时任务保活（开关，默认开） */
+  keepAlive: boolean;
+}
+
+/** 订阅分组配额：解析自响应头 subscription-userinfo（upload/download/total/expire）。 */
+export interface SubQuota {
+  upload: number;
+  download: number;
+  total: number;
+  /** 到期时间戳（秒），0 表示订阅未返回到期时间 */
+  expire: number;
+}
+
+/** 带响应头的 GET 结果：body 为响应正文，headers 的键统一转小写。 */
+export interface FetchResult {
+  body: string;
+  headers: Map<string, string>;
 }
 
 export class CoreState {

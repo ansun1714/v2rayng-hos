@@ -6,7 +6,7 @@ import { vpnExtension, http, connection } from '@kit.NetworkKit';
 import { PromptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { ProxyLink } from '../core/ProxyLink';
-import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope, AppSettings } from '../core/Model';
+import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope, AppSettings, SubQuota, FetchResult } from '../core/Model';
 import { ConfigBuilder } from '../core/ConfigBuilder';
 import { FileStore } from '../core/FileStore';
 import { KeepAliveManager } from '../core/KeepAliveManager';
@@ -101,6 +101,15 @@ class NodeGroup {
   indices: number[] = [];
 }
 
+/** 设置项局部补丁：字段全部可选，未传的保持原值。 */
+interface SettingsPatch {
+  testConcurrency?: number;
+  speedBytes?: number;
+  autoConnect?: boolean;
+  failover?: boolean;
+  keepAlive?: boolean;
+}
+
 /**
  * 列表中的一行。LazyForEach 只按需创建可见的行，
  * 所以这里把要显示的字段都拍平，渲染时不用再回头读 profiles。
@@ -123,6 +132,8 @@ class NodeRow {
   addr: string = '';
   selected: boolean = false;
   moreLeft: number = 0;
+  /** 订阅配额/到期展示文案（仅订阅分组头使用） */
+  quotaText: string = '';
   /** 订阅组在这里是一整块卡片：首行给上圆角、末行给下圆角 */
   firstInBlock: boolean = false;
   lastInBlock: boolean = false;
@@ -207,6 +218,7 @@ class NodeDataSource implements IDataSource {
     copy.addr = src.addr;
     copy.selected = flag;
     copy.moreLeft = src.moreLeft;
+    copy.quotaText = src.quotaText;
     this.rows[at] = copy;
     this.listeners.forEach((listener: DataChangeListener) => {
       listener.onDataChange(at);
@@ -320,13 +332,39 @@ struct Index {
 
   // 测速偏好（并发 / 包大小）与内核版本
   @State settingsPanel: boolean = false;
-  @State settings: AppSettings = { testConcurrency: 24, speedBytes: 5242880 };
+  @State settings: AppSettings = {
+    testConcurrency: 24, speedBytes: 5242880,
+    autoConnect: true, failover: true, keepAlive: true
+  };
   @State coreVersion: string = '';
 
   // 订阅分组改名：key = 订阅 URL，value = 用户自己起的名字（存 group-names.json）
   @State renameKey: string = '';
   @State renameText: string = '';
   private groupNames: Map<string, string> = new Map<string, string>();
+
+  // 测速停止标志：批次间隙与单点测速轮询循环都会检查
+  private testStop: boolean = false;
+
+  // 应用内日志查看器：三通道（ui / vpn / watchdog）切换、刷新、清空、行数统计
+  @State logPanel: boolean = false;
+  @State logChannel: string = 'ui';
+  @State logLines: string[] = [];
+  @State logMsg: string = '';
+
+  // 本次会话：连接起始时间戳、内核计数器基线、界面展示文案
+  private sessionStart: number = 0;
+  private baseUp: number = 0;
+  private baseDown: number = 0;
+  @State sessionText: string = '';
+
+  // 订阅配额：key = 订阅 URL，解析自 subscription-userinfo 响应头
+  private subQuota: Map<string, SubQuota> = new Map<string, SubQuota>();
+
+  // 新建分组面板：名称 + 订阅链接（链接留空 = 手动分组）
+  @State groupPanel: boolean = false;
+  @State gName: string = '';
+  @State gUrl: string = '';
 
   private filesDir: string = '';
   private pollTimer: number = -1;
@@ -523,6 +561,9 @@ struct Index {
       return;
     }
     const mgr: KeepAliveManager = KeepAliveManager.getInstance();
+    if (mgr.autoConnectDisabled()) {
+      return;
+    }
     if (checkState) {
       mgr.requestColdStartHeal(this.filesDir);
     }
@@ -549,7 +590,7 @@ struct Index {
     }
     AppStorage.setOrCreate<boolean>('needRecover', false);
     const mgr: KeepAliveManager = KeepAliveManager.getInstance();
-    if (mgr.isUserStopped() || !mgr.canAutoRecover()) {
+    if (mgr.isUserStopped() || !mgr.canAutoRecover() || mgr.autoConnectDisabled()) {
       return;
     }
     FileStore.appendLog(this.filesDir, 'recover: needRecover consumed (onForeground cross-check)');
@@ -564,6 +605,10 @@ struct Index {
   private scheduleRecover(): void {
     const mgr: KeepAliveManager = KeepAliveManager.getInstance();
     if (this.recovering || this.recoverTimer >= 0) {
+      return;
+    }
+    // 自动连接被用户关闭：冷启动 / 掉线都不自动重连
+    if (mgr.autoConnectDisabled()) {
       return;
     }
     if (mgr.isUserStopped()) {
@@ -653,8 +698,10 @@ struct Index {
     if (this.ruleUrl.length === 0) {
       this.syncRuleUrlFromStore();
     }
-    // 测速偏好（并发 / 包大小）
+    // 测速偏好（并发 / 包大小 / 连接行为开关）
     this.settings = FileStore.loadSettings(this.filesDir);
+    // 订阅配额与到期信息（上次成功拉取时落盘）
+    this.subQuota = FileStore.loadSubQuota(this.filesDir);
     // 内核版本：扩展进程启动时写入，界面只读展示
     this.coreVersion = FileStore.readText(FileStore.coreVersionPath(this.filesDir)).trim();
   }
@@ -691,6 +738,12 @@ struct Index {
           // 刚连上，隧道还没稳，稍等一下再测出口
           this.exitEmptyStreak = 0;
           this.exitBlocked = false;
+          // 记录本次会话起点与内核计数器基线，会话流量 = 当前值 - 基线
+          this.sessionStart = Date.now();
+          this.baseUp = state.up !== undefined ? state.up : 0;
+          this.baseDown = state.down !== undefined ? state.down : 0;
+          this.refreshSessionText(state.up !== undefined ? state.up : 0,
+            state.down !== undefined ? state.down : 0);
           this.scheduleExitRefresh(2000, 1);
           // 连上立即申请一次长时任务（force）：不再只依赖边沿触发。
           // 真机 14:10/14:14 重连时边沿丢失导致 69 分钟后台无保活，
@@ -701,6 +754,8 @@ struct Index {
           this.exitBusy = false;
           this.exitEmptyStreak = 0;
           this.exitBlocked = false;
+          this.sessionStart = 0;
+          this.sessionText = '';
           if (this.exitInfo.length > 0) {
             this.exitInfo = '';
           }
@@ -737,6 +792,11 @@ struct Index {
       // 累计下行用于两件事：证明隧道确实有流量；熔断后判断是节点死还是探测被冻结
       if (state.totalDown !== undefined) {
         this.lastTotalDown = state.totalDown;
+      }
+      // 本次会话时长与上下行差值（每秒随状态文件刷新一次）
+      if (this.running) {
+        this.refreshSessionText(state.up !== undefined ? state.up : 0,
+          state.down !== undefined ? state.down : 0);
       }
       // 熔断不再永久停：每 60s 自己复检一次，有流量就重试探测，没流量就尝试故障转移
       this.tickExitBlocked();
@@ -785,6 +845,10 @@ struct Index {
    * → 未测速节点按列表顺序轮转。已试过的 server:port 不重复试，最多 FAILOVER_MAX 次。
    */
   private tryFailover(reason: string): void {
+    // 故障转移被用户关闭：节点无流量时不自动换节点，保留在当前节点上
+    if (!this.settings.failover) {
+      return;
+    }
     if (this.profiles.length < 2 || this.selected < 0 || this.selected >= this.profiles.length) {
       return;
     }
@@ -850,6 +914,23 @@ struct Index {
       return (value / 1024).toFixed(1) + 'KB';
     }
     return String(value) + 'B';
+  }
+
+  /** 本次会话时长 + 上下行差值；内核计数器基线在连上瞬间记下。 */
+  private refreshSessionText(up: number, down: number): void {
+    if (this.sessionStart === 0) {
+      this.sessionText = '';
+      return;
+    }
+    const sec: number = Math.max(0, Math.floor((Date.now() - this.sessionStart) / 1000));
+    const hh: number = Math.floor(sec / 3600);
+    const mm: number = Math.floor((sec % 3600) / 60);
+    const ss: number = sec % 60;
+    const pad = (n: number): string => String(n).padStart(2, '0');
+    const dur: string = hh > 0 ? (hh + ':' + pad(mm) + ':' + pad(ss)) : (mm + ':' + pad(ss));
+    const du: number = Math.max(0, up - this.baseUp);
+    const dd: number = Math.max(0, down - this.baseDown);
+    this.sessionText = '时长 ' + dur + ' · ↑' + Index.human(du) + ' ↓' + Index.human(dd);
   }
 
   /** IPv6 出口地址太长，中段省略，别把后面的地区挤掉 */
@@ -1007,6 +1088,9 @@ struct Index {
       head.groupCount = group.indices.length;
       head.groupOpen = this.groupOpen(group);
       head.firstInBlock = true;
+      // 订阅配额/到期：手动分组没有配额信息
+      const quota: SubQuota | undefined = this.subQuota.get(group.key);
+      head.quotaText = quota !== undefined ? Index.quotaTextOf(quota) : '';
       // 折叠着、或组里没节点：这一行就是整块的头尾
       head.lastInBlock = !head.groupOpen || group.indices.length === 0;
       rows.push(head);
@@ -1073,6 +1157,18 @@ struct Index {
         subs.push(group);
       }
       group.indices.push(index);
+    });
+    // 已登记但当前没有节点的分组（手动空分组、拉取失败的订阅）也显示出来，
+    // 否则新建的手动分组在列表里看不到，删除入口也找不到
+    this.groupNames.forEach((name: string, key: string) => {
+      if (key.length === 0 || byKey.has(key)) {
+        return;
+      }
+      const g: NodeGroup = new NodeGroup();
+      g.key = key;
+      g.title = name.length > 0 ? name : Index.subTitle(key);
+      byKey.set(key, g);
+      subs.push(g);
     });
     const result: NodeGroup[] = [];
     if (manual.indices.length > 0) {
@@ -1171,6 +1267,145 @@ struct Index {
     this.closeRename();
     this.bump();
     this.toast.showToast({ message: name.length === 0 ? '已恢复默认名称' : '已重命名为「' + name + '」' });
+  }
+
+  // ---------- 分组新建 / 删除 ----------
+
+  openNewGroup(): void {
+    this.gName = '';
+    this.gUrl = '';
+    this.groupPanel = true;
+  }
+
+  closeNewGroup(): void {
+    this.groupPanel = false;
+    this.gName = '';
+    this.gUrl = '';
+  }
+
+  /**
+   * 保存新分组：名称必填；订阅链接留空则只建一个空分组壳（后续可在编辑面板挂节点）。
+   * 链接填写时先登记分组名，再走与「导入订阅」相同的拉取流程。
+   */
+  saveNewGroup(): void {
+    const name: string = this.gName.trim();
+    const url: string = this.gUrl.trim();
+    if (name.length === 0) {
+      this.toast.showToast({ message: '分组名称不能为空' });
+      return;
+    }
+    if (url.length > 0 && !url.toLowerCase().startsWith('https://')) {
+      this.toast.showToast({ message: '订阅链接必须是 https 开头' });
+      return;
+    }
+    if (url.length === 0) {
+      // 手动分组：key 加 manual: 前缀，与订阅 URL 区分开
+      const key: string = 'manual:' + String(Date.now());
+      this.groupNames.set(key, name);
+      this.saveGroupNames();
+      this.cacheProfiles = undefined;
+      this.cacheGroups = [];
+      this.closeNewGroup();
+      this.bump();
+      this.toast.showToast({ message: '已创建分组「' + name + '」' });
+      return;
+    }
+    this.groupNames.set(url, name);
+    this.saveGroupNames();
+    this.closeNewGroup();
+    this.subInput = url;
+    this.importSubscription();
+  }
+
+  /** 删除整组：先弹确认，列出组内节点数。 */
+  deleteGroup(key: string): void {
+    if (key.length === 0) {
+      return;
+    }
+    const count: number = this.profiles.filter((p: Profile) => p.subId === key).length;
+    const title: string = this.groupNames.get(key) !== undefined ?
+      this.groupNames.get(key) as string : Index.subTitle(key);
+    AlertDialog.show({
+      title: '删除分组',
+      message: '将删除「' + title + '」下全部 ' + String(count) + ' 个节点，不可恢复。',
+      autoCancel: true,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#C62828',
+        action: () => {
+          this.doDeleteGroup(key);
+        }
+      }
+    });
+  }
+
+  private doDeleteGroup(key: string): void {
+    const prev: Profile | undefined = this.selected >= 0 && this.selected < this.profiles.length
+      ? this.profiles[this.selected] : undefined;
+    const list: Profile[] = this.profiles.filter((p: Profile) => p.subId !== key);
+    this.groupNames.delete(key);
+    this.subQuota.delete(key);
+    this.groupPage.delete(key);
+    this.openedKeys = this.openedKeys.filter((k: string) => k !== key);
+    this.closedKeys = this.closedKeys.filter((k: string) => k !== key);
+    this.saveGroupNames();
+    FileStore.saveSubQuota(this.filesDir, this.subQuota);
+    if (prev !== undefined) {
+      const hit: number = this.findProfileByIdentity(list, prev);
+      this.selected = hit >= 0 ? hit : -1;
+    }
+    this.saveAll(list);
+    this.cacheProfiles = undefined;
+    this.cacheGroups = [];
+    this.bump();
+    this.toast.showToast({ message: '已删除分组' });
+    this.reconnectSoon();
+  }
+
+  // ---------- 清空全部 ----------
+
+  /** 一键清空：节点与订阅分组全部删除；分流规则、分应用名单保留。 */
+  clearAllProfiles(): void {
+    AlertDialog.show({
+      title: '清空全部节点',
+      message: '将删除全部节点与订阅分组（分流规则、分应用名单保留），不可恢复。',
+      autoCancel: true,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: '清空',
+        fontColor: '#C62828',
+        action: () => {
+          this.doClearAll();
+        }
+      }
+    });
+  }
+
+  private doClearAll(): void {
+    this.saveAll([]);
+    this.groupNames.clear();
+    this.subQuota.clear();
+    this.groupPage.clear();
+    this.openedKeys = [];
+    this.closedKeys = [];
+    this.saveGroupNames();
+    FileStore.saveSubQuota(this.filesDir, this.subQuota);
+    this.selected = -1;
+    this.cacheProfiles = undefined;
+    this.cacheGroups = [];
+    this.bump();
+    this.toast.showToast({ message: '已清空全部节点' });
+    // 清空后没有可连节点：断开隧道，避免内核挂在已失效的配置上
+    this.disconnect();
   }
 
   /** 订阅标题：取 host[:port]，避免整条长链接把行撑爆。 */
@@ -1343,13 +1578,15 @@ struct Index {
     this.toast.showToast({ message: '链接已复制' });
   }
 
-  async httpGet(url: string, timeoutMs: number): Promise<string> {
+  /** 带响应头的 GET：httpGet 的底层版本，订阅配额解析需要读 subscription-userinfo 头。 */
+  async httpGetRaw(url: string, timeoutMs: number): Promise<FetchResult> {
+    const empty: FetchResult = { body: '', headers: new Map<string, string>() };
     // 兜底：所有拉取一律只走 https。订阅与规则链接走明文时 token 和节点凭据
     // 会被同一网络里的中间人读走，响应还能被改写。出口探测两个地址本来就是 https，
     // 测速走 NAPI 的 proxyDelay 不经过这里，因此不受影响。
     if (!url.toLowerCase().startsWith('https://')) {
       hilog.error(0x0001, 'V2rayM-UI', 'httpGet refused: not https');
-      return '';
+      return empty;
     }
     const req = http.createHttp();
     try {
@@ -1364,25 +1601,103 @@ struct Index {
         // 不打印 url：订阅链接里带 token，落到系统日志等于把凭据写进日志
         hilog.error(0x0001, 'V2rayM-UI', 'httpGet code=%{public}d', resp.responseCode);
         FileStore.appendLog(this.filesDir, 'httpGet non-200: ' + String(resp.responseCode));
-        return '';
+        return empty;
+      }
+      const headers: Map<string, string> = new Map<string, string>();
+      try {
+        const rawHeader: Record<string, string> = resp.header as Record<string, string>;
+        if (rawHeader !== undefined && rawHeader !== null) {
+          Object.keys(rawHeader).forEach((k: string) => {
+            headers.set(k.toLowerCase(), String(rawHeader[k]));
+          });
+        }
+      } catch (err) {
       }
       // 某些版本 result 会是 ArrayBuffer，直接 String() 只会得到 "[object ArrayBuffer]"
       const raw: string | ArrayBuffer = resp.result as string | ArrayBuffer;
+      let body: string;
       if (typeof raw === 'string') {
-        return raw as string;
+        body = raw as string;
+      } else {
+        const decoder = util.TextDecoder.create('utf-8');
+        body = decoder.decodeToString(new Uint8Array(raw as ArrayBuffer));
       }
-      const decoder = util.TextDecoder.create('utf-8');
-      return decoder.decodeToString(new Uint8Array(raw as ArrayBuffer));
+      return { body: body, headers: headers };
     } catch (err) {
       const be = err as BusinessError;
       hilog.error(0x0001, 'V2rayM-UI', 'httpGet fail code=%{public}d msg=%{public}s',
         be.code !== undefined ? be.code : -1, String(be.message));
       FileStore.appendLog(this.filesDir, 'httpGet err: code=' +
         String(be.code !== undefined ? be.code : -1) + ' msg=' + String(be.message));
-      return '';
+      return empty;
     } finally {
       req.destroy();
     }
+  }
+
+  async httpGet(url: string, timeoutMs: number): Promise<string> {
+    const res: FetchResult = await this.httpGetRaw(url, timeoutMs);
+    return res.body;
+  }
+
+  /**
+   * 解析 subscription-userinfo 响应头。格式：
+   * upload=..., download=..., total=..., expire=...（expire 为 Unix 秒，可缺省）。
+   * 任一字段缺失按 0 处理；整头缺失返回 undefined。
+   */
+  private static parseSubQuota(headerValue: string): SubQuota | undefined {
+    if (headerValue.trim().length === 0) {
+      return undefined;
+    }
+    const quota: SubQuota = { upload: 0, download: 0, total: 0, expire: 0 };
+    const parts: string[] = headerValue.split(',');
+    let hit: boolean = false;
+    parts.forEach((part: string) => {
+      const kv: string[] = part.trim().split('=');
+      if (kv.length !== 2) {
+        return;
+      }
+      const key: string = kv[0].trim().toLowerCase();
+      const num: number = Number.parseInt(kv[1].trim());
+      const value: number = Number.isNaN(num) ? 0 : num;
+      if (key === 'upload') { quota.upload = value; hit = true; }
+      else if (key === 'download') { quota.download = value; hit = true; }
+      else if (key === 'total') { quota.total = value; hit = true; }
+      else if (key === 'expire') { quota.expire = value; hit = true; }
+    });
+    return hit ? quota : undefined;
+  }
+
+  /** 落盘并缓存一组订阅配额；url 为空不写。 */
+  private saveQuota(url: string, quota: SubQuota | undefined): void {
+    if (url.length === 0) {
+      return;
+    }
+    if (quota === undefined) {
+      return;
+    }
+    this.subQuota.set(url, quota);
+    FileStore.saveSubQuota(this.filesDir, this.subQuota);
+  }
+
+  /** 配额展示文案：已用/总量 + 剩余；无总量只显示已用；到期时间另起一段。 */
+  private static quotaTextOf(quota: SubQuota): string {
+    const used: number = quota.upload + quota.download;
+    let text: string;
+    if (quota.total > 0) {
+      const remain: number = Math.max(0, quota.total - used);
+      text = '已用 ' + Index.human(used) + ' / ' + Index.human(quota.total) +
+        ' · 剩 ' + Index.human(remain);
+    } else {
+      text = '已用 ' + Index.human(used);
+    }
+    if (quota.expire > 0) {
+      const d: Date = new Date(quota.expire * 1000);
+      const mm: string = String(d.getMonth() + 1).padStart(2, '0');
+      const dd: string = String(d.getDate()).padStart(2, '0');
+      text += ' · 到期 ' + d.getFullYear() + '-' + mm + '-' + dd;
+    }
+    return text;
   }
 
   /**
@@ -1683,6 +1998,9 @@ struct Index {
    * 现在由单例以状态驱动方式统一申请、复核与释放。
    */
   private requestKeepAlive(): void {
+    if (!this.settings.keepAlive) {
+      return;
+    }
     const uiContext = getContext(this) as common.UIAbilityContext;
     KeepAliveManager.getInstance().ensureRunning(uiContext, true)
       .catch((err: Error) => {
@@ -1692,6 +2010,9 @@ struct Index {
 
   /** 低频复核：管理器内部 ≥30s 节流 + 冷却，force=false。 */
   private ensureKeepAlive(): void {
+    if (!this.settings.keepAlive) {
+      return;
+    }
     const uiContext = getContext(this) as common.UIAbilityContext;
     KeepAliveManager.getInstance().ensureRunning(uiContext, false)
       .catch((err: Error) => {
@@ -1868,7 +2189,9 @@ struct Index {
       return;
     }
     this.statusText = '正在拉取订阅…';
-    const body: string = await this.httpGet(url, 15000);
+    const fetched: FetchResult =
+      await this.httpGetRaw(url, 15000);
+    const body: string = fetched.body;
     // 拉取期间可能开始了「全部更新」：已飞行的这次导入不能再 applySubContent，
     // 否则会在批量合并阶段多写一次盘并可能多触发一次重连。同时恢复上面设的进度文案。
     if (this.updatingAll) {
@@ -1881,6 +2204,10 @@ struct Index {
       return;
     }
     const added: number = this.applySubContent(url, body);
+    // 配额头只在内容解析成功后落盘：失败的响应不该覆盖上次记下的配额
+    if (added > 0) {
+      this.saveQuota(url, Index.parseSubQuota(fetched.headers.get('subscription-userinfo') || ''));
+    }
     this.statusText = this.running ? '已连接' : '未连接';
     if (added < 0) {
       this.toast.showToast({ message: '订阅内容无法解析（非 base64 也非链接）' });
@@ -1905,13 +2232,19 @@ struct Index {
       this.toast.showToast({ message: '正在全部更新，稍后再试' });
       return;
     }
-    // 老版本允许 http 导入的订阅会落到这里；手动节点组没有刷新按钮，传进来的必然是订阅地址
+    // 手动分组没有订阅链接，无需刷新；老版本允许 http 导入的订阅会落到这里
+    if (url.startsWith('manual:')) {
+      this.toast.showToast({ message: '手动分组没有订阅链接' });
+      return;
+    }
     if (!url.toLowerCase().startsWith('https://')) {
       this.toast.showToast({ message: '该订阅是明文 http，已拒绝更新；请改用 https 地址重新导入' });
       return;
     }
     this.statusText = '正在更新订阅…';
-    const body: string = await this.httpGet(url, 15000);
+    const fetched: FetchResult =
+      await this.httpGetRaw(url, 15000);
+    const body: string = fetched.body;
     // 拉取期间可能开始了「全部更新」：已飞行的单组更新必须与批量合并互斥，
     // 否则会多写一次盘并可能多触发一次重连。同时恢复上面设的进度文案。
     if (this.updatingAll) {
@@ -1924,6 +2257,9 @@ struct Index {
       return;
     }
     const added: number = this.applySubContent(url, body);
+    if (added > 0) {
+      this.saveQuota(url, Index.parseSubQuota(fetched.headers.get('subscription-userinfo') || ''));
+    }
     this.statusText = this.running ? '已连接' : '未连接';
     // -1 是 base64 解码失败、0 是解析出 0 条节点，语义不同，分开提示别混淆
     if (added < 0) {
@@ -2031,7 +2367,10 @@ struct Index {
     try {
       // 并发拉取上限 3：照抄 runPool 的 cursor / worker / Promise.all 结构
       const bodies: Map<string, string> = new Map<string, string>();
+      const quotaHeaders: Map<string, Map<string, string>> =
+        new Map<string, Map<string, string>>();
       const cursor: number[] = [0];
+      const emptyRaw: FetchResult = { body: '', headers: new Map<string, string>() };
       const worker = async (): Promise<void> => {
         while (true) {
           const at: number = cursor[0];
@@ -2043,9 +2382,12 @@ struct Index {
           // 单请求超时：给每个 URL 一个确定上界，httpGet 的 promise 永不 settle 时
           // 16s 后返回 '' 判为该订阅失败，worker 继续推进，Promise.all 与 finally 必然执行。
           // 不用整体 race（超时后 worker 仍在飞行会游离写 bodies/updDone），也不加看门狗定时器。
-          const timeout: Promise<string> = Index.sleep(16000).then((): string => '');
-          const body: string = await Promise.race([this.httpGet(url, 15000), timeout]);
-          bodies.set(url, body);
+          const timeout: Promise<FetchResult> =
+            Index.sleep(16000).then((): FetchResult => emptyRaw);
+          const fetched: FetchResult =
+            await Promise.race([this.httpGetRaw(url, 15000), timeout]);
+          bodies.set(url, fetched.body);
+          quotaHeaders.set(url, fetched.headers);
           this.updDone = this.updDone + 1;
           // 「已处理」含拉取失败的请求，不表示成功；成功订阅数在汇总 toast 里单独统计
           this.updInfo = '已处理 ' + String(this.updDone) + ' · 待更新 ' +
@@ -2085,6 +2427,9 @@ struct Index {
           fresh.name = this.uniqueName(list, fresh.name);
           list.push(fresh);
         }
+        const headers: Map<string, string> | undefined = quotaHeaders.get(url);
+        this.saveQuota(url, Index.parseSubQuota(
+          headers !== undefined ? (headers.get('subscription-userinfo') || '') : ''));
         okSubs++;
         addedTotal += nodes.length;
       }
@@ -2150,7 +2495,7 @@ struct Index {
     }
   }
 
-  /** 单个分组测速：只测这一组的节点。 */
+  /** 单个分组测速：只测这一组的节点。开跑前先弹确认框。 */
   async testGroup(group: NodeGroup): Promise<void> {
     if (this.updatingAll) {
       this.toast.showToast({ message: '正在全部更新，稍后再测速' });
@@ -2163,7 +2508,14 @@ struct Index {
     if (this.testing) {
       return;
     }
+    this.confirmTest(group.indices.length, () => {
+      this.runGroupTest(group);
+    });
+  }
+
+  private async runGroupTest(group: NodeGroup): Promise<void> {
     this.testing = true;
+    this.testStop = false;
     this.testDone = 0;
     this.testTotal = group.indices.length;
     this.testInfo = '已测 0 · 待测 ' + String(this.testTotal);
@@ -2171,13 +2523,48 @@ struct Index {
     this.sortByDelay = false;
     this.bump();
     await this.runPool(group.indices, this.settings.testConcurrency);
+    const stopped: boolean = this.testStop;
     this.testing = false;
+    this.testStop = false;
     this.testInfo = '';
     this.sortByDelay = true;
     // 换一次引用：即使排序开关本来就是 true，也能让分组缓存失效、真正重排
     this.profiles = this.profiles.slice();
     this.bump();
-    this.toast.showToast({ message: '本组测速完成，已按延迟排序' });
+    this.toast.showToast({ message: stopped ? '已停止测速' : '本组测速完成，已按延迟排序' });
+  }
+
+  /**
+   * 测速前确认弹窗：显示待测节点数、并发数，说明超时节点自动跳过；
+   * 批量延迟测试只打 generate_204 小包，不产生大流量。
+   */
+  private confirmTest(count: number, onOk: () => void): void {
+    if (count <= 0) {
+      this.toast.showToast({ message: '本组没有待测节点' });
+      return;
+    }
+    AlertDialog.show({
+      title: '开始测速',
+      message: '待测 ' + String(count) + ' 个节点 · 并发 ' + String(this.settings.testConcurrency) +
+        '\n超时/不通节点自动跳过并标记 -1，测速过程中可随时停止。',
+      autoCancel: true,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: '开始测速',
+        action: () => {
+          onOk();
+        }
+      }
+    });
+  }
+
+  /** 用户在进度卡点「停止」：批次间隙与单点轮询循环都会在下一拍退出。 */
+  private stopTesting(): void {
+    this.testStop = true;
   }
 
   /** 并发池：固定 concurrency 个 worker 从队列里取节点去测，测完更新进度。 */
@@ -2185,6 +2572,10 @@ struct Index {
     const cursor: number[] = [0];
     const worker = async (): Promise<void> => {
       while (true) {
+        // 停止标志在批次间隙生效：当前在飞的单点测速由 testOne 内部轮询退出
+        if (this.testStop) {
+          return;
+        }
         const at: number = cursor[0];
         cursor[0] = cursor[0] + 1;
         if (at >= indices.length) {
@@ -2349,8 +2740,14 @@ struct Index {
     let delay: number = -1;
     // 内核侧测速超时 5 秒，扩展桥扫描间隔 1.5 秒；这里最多等 10 秒（20 × 500ms），
     // 等不到就回填 -1。死节点不该占着并发槽拖垮整批排序。
+    let stopped: boolean = false;
     for (let i = 0; i < 20; i++) {
       await Index.sleep(500);
+      // 用户点了停止：立刻退出轮询，清理请求/结果文件，节点保持未测状态（灰显 —）
+      if (this.testStop) {
+        stopped = true;
+        break;
+      }
       const text: string = FileStore.readText(resFile);
       if (text.length === 0) {
         continue;
@@ -2366,6 +2763,9 @@ struct Index {
     }
     FileStore.removeFile(reqFile);
     FileStore.removeFile(resFile);
+    if (stopped) {
+      return;
+    }
     // 回填延迟。批量测速时由 runPool 每几个节点统一刷新一次列表，
     // 单点测速则立刻刷新。
     this.profiles[index].delay = delay;
@@ -2402,7 +2802,17 @@ struct Index {
       this.toast.showToast({ message: '请先连接，内核起来后才能测速' });
       return;
     }
+    if (this.testing) {
+      return;
+    }
+    this.confirmTest(this.profiles.length, () => {
+      this.runAllTest();
+    });
+  }
+
+  private async runAllTest(): Promise<void> {
     this.testing = true;
+    this.testStop = false;
     this.testDone = 0;
     this.testTotal = this.profiles.length;
     this.testInfo = '已测 0 · 待测 ' + String(this.testTotal);
@@ -2413,12 +2823,14 @@ struct Index {
       all.push(i);
     }
     await this.runPool(all, this.settings.testConcurrency);
+    const stopped: boolean = this.testStop;
     this.testing = false;
+    this.testStop = false;
     this.testInfo = '';
     this.sortByDelay = true;
     this.profiles = this.profiles.slice();
     this.bump();
-    this.toast.showToast({ message: '测速完成，已按延迟排序' });
+    this.toast.showToast({ message: stopped ? '已停止测速' : '测速完成，已按延迟排序' });
   }
 
   /** 代理名可能含中文，URL 里必须做百分号编码。 */
@@ -2453,6 +2865,39 @@ struct Index {
   clearRunLog(): void {
     FileStore.clearLogs(this.filesDir);
     this.toast.showToast({ message: '运行日志已清除' });
+  }
+
+  // ---------- 应用内日志查看器 ----------
+
+  private openLogs(): void {
+    this.logPanel = true;
+    this.refreshLogs();
+  }
+
+  private switchLogChannel(channel: string): void {
+    this.logChannel = channel;
+    this.refreshLogs();
+  }
+
+  private refreshLogs(): void {
+    const text: string = FileStore.readText(FileStore.logPathOf(this.filesDir, this.logChannel));
+    const raw: string[] = text.split('\n');
+    const lines: string[] = [];
+    raw.forEach((line: string) => {
+      const clean: string = line.replace(/\r$/, '');
+      if (clean.trim().length > 0) {
+        lines.push(clean);
+      }
+    });
+    // 最新在前：环形日志文件本身按时间正序写，界面倒序展示
+    lines.reverse();
+    this.logLines = lines;
+    this.logMsg = lines.length > 0 ? String(lines.length) + ' 行 · 最新在前' : '暂无日志';
+  }
+
+  private clearChannelLog(): void {
+    FileStore.removeFile(FileStore.logPathOf(this.filesDir, this.logChannel));
+    this.refreshLogs();
   }
 
   // ---------- 分流规则 ----------
@@ -2496,8 +2941,26 @@ struct Index {
   saveSettingsConfig(): void {
     FileStore.saveSettings(this.filesDir, this.settings);
     FileStore.appendLog(this.filesDir, 'settings saved: concurrency=' +
-      String(this.settings.testConcurrency) + ' speedBytes=' + String(this.settings.speedBytes));
+      String(this.settings.testConcurrency) + ' speedBytes=' + String(this.settings.speedBytes) +
+      ' autoConnect=' + String(this.settings.autoConnect) +
+      ' failover=' + String(this.settings.failover) +
+      ' keepAlive=' + String(this.settings.keepAlive));
+    // 保活被关掉：释放已申请的长时任务；重新打开后下次连接边沿会再次申请
+    if (!this.settings.keepAlive) {
+      this.releaseKeepAlive();
+    }
     this.toast.showToast({ message: '已保存' });
+  }
+
+  /** 局部更新测速/连接行为偏好，其余字段原样保留（ArkTS 对象字面量不做展开拷贝）。 */
+  private patchSettings(patch: SettingsPatch): void {
+    this.settings = {
+      testConcurrency: patch.testConcurrency !== undefined ? patch.testConcurrency : this.settings.testConcurrency,
+      speedBytes: patch.speedBytes !== undefined ? patch.speedBytes : this.settings.speedBytes,
+      autoConnect: patch.autoConnect !== undefined ? patch.autoConnect : this.settings.autoConnect,
+      failover: patch.failover !== undefined ? patch.failover : this.settings.failover,
+      keepAlive: patch.keepAlive !== undefined ? patch.keepAlive : this.settings.keepAlive
+    };
   }
 
   openRules(): void {
@@ -3320,8 +3783,33 @@ struct Index {
           .onClick(() => {
             this.testGroupByKey(row.groupKey);
           })
+
+          // 删除整组：红色 ✕，先弹确认再删
+          Row() {
+            Text('✕').fontSize(18).fontColor('#C62828')
+          }
+          .width(36)
+          .height(36)
+          .justifyContent(FlexAlign.Center)
+          .backgroundColor('#FDECEA')
+          .borderRadius(18)
+          .border({ width: 1, color: '#F5C6C2' })
+          .onClick(() => {
+            this.deleteGroup(row.groupKey);
+          })
         }
         .width('100%')
+
+        // 订阅配额/到期第二行：无配额信息（手动组或订阅未返回）时不占位
+        if (row.quotaText.length > 0) {
+          Text(row.quotaText)
+            .fontSize(12)
+            .fontColor('#5F6B7A')
+            .width('100%')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .padding({ left: 30, top: 2 })
+        }
       }
       .width('100%')
       .padding({ left: 14, right: 14, top: 10, bottom: 10 })
@@ -3464,6 +3952,26 @@ struct Index {
             this.openRules();
           })
 
+        Button('新建分组')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.openNewGroup();
+          })
+
+        Button('查看运行日志')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.openLogs();
+          })
+
         Button('清除运行日志')
           .width('100%')
           .height(44)
@@ -3475,6 +3983,20 @@ struct Index {
           })
 
         Text('运行日志只存在本机应用目录，记录连接状态与出口探测结果，保留最近 240 行。')
+          .fontSize(13)
+          .fontColor('#5A5A5A')
+
+        Button('清空全部节点')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#FDECEA')
+          .fontColor('#C62828')
+          .onClick(() => {
+            this.clearAllProfiles();
+          })
+
+        Text('清空后全部节点与订阅分组都会被删除，分流规则和分应用名单保留。')
           .fontSize(13)
           .fontColor('#5A5A5A')
 
@@ -3611,9 +4133,9 @@ struct Index {
         .fontSize(13)
         .fontColor('#5A5A5A')
       Row({ space: 8 }) {
-        this.chip('6', String(this.settings.testConcurrency), () => { this.settings = { testConcurrency: 6, speedBytes: this.settings.speedBytes }; })
-        this.chip('12', String(this.settings.testConcurrency), () => { this.settings = { testConcurrency: 12, speedBytes: this.settings.speedBytes }; })
-        this.chip('24', String(this.settings.testConcurrency), () => { this.settings = { testConcurrency: 24, speedBytes: this.settings.speedBytes }; })
+        this.chip('6', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 6 }); })
+        this.chip('12', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 12 }); })
+        this.chip('24', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 24 }); })
       }
       .width('100%')
 
@@ -3621,11 +4143,22 @@ struct Index {
         .fontSize(13)
         .fontColor('#5A5A5A')
       Row({ space: 8 }) {
-        this.chip('1 MB', this.settings.speedBytes === 1048576 ? '1 MB' : '', () => { this.settings = { testConcurrency: this.settings.testConcurrency, speedBytes: 1048576 }; })
-        this.chip('5 MB', this.settings.speedBytes === 5242880 ? '5 MB' : '', () => { this.settings = { testConcurrency: this.settings.testConcurrency, speedBytes: 5242880 }; })
-        this.chip('10 MB', this.settings.speedBytes === 10485760 ? '10 MB' : '', () => { this.settings = { testConcurrency: this.settings.testConcurrency, speedBytes: 10485760 }; })
+        this.chip('1 MB', this.settings.speedBytes === 1048576 ? '1 MB' : '', () => { this.patchSettings({ speedBytes: 1048576 }); })
+        this.chip('5 MB', this.settings.speedBytes === 5242880 ? '5 MB' : '', () => { this.patchSettings({ speedBytes: 5242880 }); })
+        this.chip('10 MB', this.settings.speedBytes === 10485760 ? '10 MB' : '', () => { this.patchSettings({ speedBytes: 10485760 }); })
       }
       .width('100%')
+
+      Divider().margin({ top: 8, bottom: 4 })
+      Text('连接行为')
+        .fontSize(15)
+        .fontWeight(FontWeight.Bold)
+      this.toggleRow('自动连接', '冷启动 / 掉线后自动重连', this.settings.autoConnect,
+        (v: boolean) => { this.patchSettings({ autoConnect: v }); })
+      this.toggleRow('故障转移', '当前节点无流量时自动切换到其他可用节点', this.settings.failover,
+        (v: boolean) => { this.patchSettings({ failover: v }); })
+      this.toggleRow('后台保活', '连接期间申请长时任务，降低后台被系统回收的概率', this.settings.keepAlive,
+        (v: boolean) => { this.patchSettings({ keepAlive: v }); })
 
       Blank()
     }
@@ -3634,6 +4167,25 @@ struct Index {
     .padding(16)
     .backgroundColor('#FFFFFF')
     .alignItems(HorizontalAlign.Start)
+  }
+
+  /** 设置页开关行：标题 + 说明 + 右侧 Switch。 */
+  @Builder
+  toggleRow(title: string, desc: string, isOn: boolean, onChange: (v: boolean) => void) {
+    Row({ space: 10 }) {
+      Column({ space: 2 }) {
+        Text(title).fontSize(15).fontColor('#1A1A1A')
+        Text(desc).fontSize(12).fontColor('#5A5A5A')
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      Toggle({ type: ToggleType.Switch, isOn: isOn })
+        .onChange((v: boolean) => {
+          onChange(v);
+        })
+    }
+    .width('100%')
+    .padding({ top: 6, bottom: 6 })
   }
 
   @Builder
@@ -4001,6 +4553,168 @@ struct Index {
     .backgroundColor('#FFFFFF')
   }
 
+  // ---------- 日志查看器面板 ----------
+
+  @Builder
+  logPanelView() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Button('返回')
+          .width(76)
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.logPanel = false;
+          })
+        Text('运行日志')
+          .fontSize(19)
+          .fontWeight(FontWeight.Bold)
+          .layoutWeight(1)
+        Button('刷新')
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.refreshLogs();
+          })
+        Button('清空')
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#FDECEA')
+          .fontColor('#C62828')
+          .onClick(() => {
+            this.clearChannelLog();
+          })
+      }
+      .width('100%')
+
+      // 三通道切换：ui=界面进程，vpn=扩展/VPN 进程，watchdog=看门狗
+      Row({ space: 8 }) {
+        this.logTab('界面', 'ui')
+        this.logTab('VPN', 'vpn')
+        this.logTab('看门狗', 'watchdog')
+        Blank()
+        Text(this.logMsg).fontSize(12).fontColor('#8A8F99')
+      }
+      .width('100%')
+
+      Scroll() {
+        Column({ space: 4 }) {
+          if (this.logLines.length === 0) {
+            Text('暂无日志').fontSize(14).fontColor('#9A9A9A').padding(16)
+          }
+          ForEach(this.logLines, (line: string) => {
+            Text(line)
+              .fontSize(12)
+              .fontColor('#333333')
+              .width('100%')
+              .wordBreak(WordBreak.BREAK_ALL)
+          }, (line: string, idx: number) => this.logChannel + '#' + String(idx) + '#' + line)
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .backgroundColor('#F7F8FA')
+      .borderRadius(10)
+      .padding(10)
+    }
+    .padding(16)
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#FFFFFF')
+  }
+
+  @Builder
+  logTab(label: string, channel: string) {
+    Button(label)
+      .height(34)
+      .fontSize(13)
+      .backgroundColor(this.logChannel === channel ? '#0A59F7' : '#F0F0F0')
+      .fontColor(this.logChannel === channel ? '#FFFFFF' : '#333333')
+      .onClick(() => {
+        this.switchLogChannel(channel);
+      })
+  }
+
+  // ---------- 新建分组面板 ----------
+
+  @Builder
+  groupPanelView() {
+    Column({ space: 12 }) {
+      Row({ space: 8 }) {
+        Button('返回')
+          .width(76)
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.closeNewGroup();
+          })
+        Text('新建分组')
+          .fontSize(19)
+          .fontWeight(FontWeight.Bold)
+          .layoutWeight(1)
+      }
+      .width('100%')
+
+      Text('分组名称：在列表里显示的标题，方便自己辨认。')
+        .fontSize(13)
+        .fontColor('#7A7A7A')
+        .width('100%')
+      TextInput({ text: this.gName, placeholder: '例如：香港 专线' })
+        .width('100%')
+        .height(46)
+        .fontSize(16)
+        .onChange((v: string) => {
+          this.gName = v;
+        })
+
+      Text('订阅链接：留空则建一个手动分组；填写后保存即拉取订阅节点。链接必须是 https。')
+        .fontSize(13)
+        .fontColor('#7A7A7A')
+        .width('100%')
+      TextInput({ text: this.gUrl, placeholder: 'https://…（可留空）' })
+        .width('100%')
+        .height(46)
+        .fontSize(14)
+        .onChange((v: string) => {
+          this.gUrl = v;
+        })
+
+      Row({ space: 12 }) {
+        Button('取消')
+          .layoutWeight(1)
+          .height(46)
+          .fontSize(16)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.closeNewGroup();
+          })
+        Button('保存')
+          .layoutWeight(1)
+          .height(46)
+          .fontSize(16)
+          .onClick(() => {
+            this.saveNewGroup();
+          })
+      }
+      .width('100%')
+
+      Blank()
+    }
+    .padding(16)
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#FFFFFF')
+  }
+
   build() {
     Stack() {
       Column({ space: 8 }) {
@@ -4047,6 +4761,17 @@ struct Index {
           .backgroundColor(this.running ? '#EAF6EA' : '#F2F3F5')
           .border({ width: 1, color: this.running ? '#CFE8CF' : '#E2E4E8' })
           .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
+
+          // 本次会话时长与会话内上下行差值（连上瞬间记基线，断开即清空）
+          if (this.running && this.sessionText.length > 0) {
+            Text(this.sessionText)
+              .fontSize(13)
+              .fontColor('#5A5A5A')
+              .width('100%')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .padding({ left: 12, right: 12 })
+          }
 
           // 长时任务连续申请失败时给出可见提示，不再静默地显示「已连接」
           if (this.keepAliveWarn.length > 0) {
@@ -4097,17 +4822,30 @@ struct Index {
             .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
           }
 
-          // 测速进度单独一张卡：和流量计数挤一行会被省略号吃掉
+          // 测速进度单独一张卡：和流量计数挤一行会被省略号吃掉；测速中可点「停止」
           if (this.testInfo.length > 0) {
-            Text(this.testInfo).fontSize(14).fontColor('#B25B3E')
-              .width('100%')
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-              .borderRadius(10)
-              .backgroundColor('#FBF1EC')
-              .border({ width: 1, color: '#EDD6C9' })
-              .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
+            Row({ space: 10 }) {
+              Text(this.testInfo).fontSize(14).fontColor('#B25B3E')
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              if (this.testing) {
+                Button('停止')
+                  .height(30)
+                  .fontSize(13)
+                  .backgroundColor('#C62828')
+                  .fontColor('#FFFFFF')
+                  .onClick(() => {
+                    this.stopTesting();
+                  })
+              }
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+            .borderRadius(10)
+            .backgroundColor('#FBF1EC')
+            .border({ width: 1, color: '#EDD6C9' })
+            .shadow({ radius: 8, color: '#14000000', offsetX: 0, offsetY: 2 })
           }
 
           // 全部更新进度：与测速进度同款橙色卡片
@@ -4231,6 +4969,14 @@ struct Index {
 
       if (this.renameKey.length > 0) {
         this.renamePanel()
+      }
+
+      if (this.logPanel) {
+        this.logPanelView()
+      }
+
+      if (this.groupPanel) {
+        this.groupPanelView()
       }
     }
     .width('100%')

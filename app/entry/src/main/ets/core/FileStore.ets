@@ -4,7 +4,7 @@
 import { fileIo } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { resourceManager } from '@kit.LocalizationKit';
-import { AppScope, AppSettings, Profile, RuleItem } from './Model';
+import { AppScope, AppSettings, Profile, RuleItem, SubQuota } from './Model';
 
 /** state.json 中由 UI 进程维护的用户意图标记（旧版本文件里没有，按 false 处理）。 */
 interface StateFlag {
@@ -309,7 +309,10 @@ export class FileStore {
   }
 
   static loadSettings(filesDir: string): AppSettings {
-    const fallback: AppSettings = { testConcurrency: 24, speedBytes: 5242880 };
+    const fallback: AppSettings = {
+      testConcurrency: 24, speedBytes: 5242880,
+      autoConnect: true, failover: true, keepAlive: true
+    };
     const text: string = FileStore.readText(FileStore.settingsPath(filesDir));
     if (text.length === 0) {
       return fallback;
@@ -322,6 +325,16 @@ export class FileStore {
       if (st.speedBytes === undefined || st.speedBytes === null || st.speedBytes < 1048576) {
         st.speedBytes = fallback.speedBytes;
       }
+      // 三个连接行为开关：旧版本 settings.json 没有这些字段，按默认 true 回填
+      if (st.autoConnect === undefined || st.autoConnect === null) {
+        st.autoConnect = fallback.autoConnect;
+      }
+      if (st.failover === undefined || st.failover === null) {
+        st.failover = fallback.failover;
+      }
+      if (st.keepAlive === undefined || st.keepAlive === null) {
+        st.keepAlive = fallback.keepAlive;
+      }
       return st;
     } catch (err) {
       return fallback;
@@ -330,6 +343,37 @@ export class FileStore {
 
   static saveSettings(filesDir: string, settings: AppSettings): void {
     FileStore.writeText(FileStore.settingsPath(filesDir), JSON.stringify(settings));
+  }
+
+  /** 订阅配额：key = 订阅 URL，value = subscription-userinfo 解析结果。 */
+  static subQuotaPath(filesDir: string): string {
+    return FileStore.ensureDir(filesDir) + '/sub-quota.json';
+  }
+
+  static loadSubQuota(filesDir: string): Map<string, SubQuota> {
+    const map: Map<string, SubQuota> = new Map<string, SubQuota>();
+    const text: string = FileStore.readText(FileStore.subQuotaPath(filesDir));
+    if (text.length === 0) {
+      return map;
+    }
+    try {
+      const pairs: [string, SubQuota][] = JSON.parse(text) as [string, SubQuota][];
+      pairs.forEach((pair: [string, SubQuota]) => {
+        if (pair !== undefined && pair.length >= 2 && pair[0].length > 0) {
+          map.set(pair[0], pair[1]);
+        }
+      });
+    } catch (err) {
+    }
+    return map;
+  }
+
+  static saveSubQuota(filesDir: string, quota: Map<string, SubQuota>): void {
+    const pairs: [string, SubQuota][] = [];
+    quota.forEach((value: SubQuota, key: string) => {
+      pairs.push([key, value]);
+    });
+    FileStore.writeText(FileStore.subQuotaPath(filesDir), JSON.stringify(pairs));
   }
 
   /** 内核版本：扩展进程启动时写入，界面进程读取展示。 */
