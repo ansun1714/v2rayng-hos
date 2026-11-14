@@ -137,6 +137,8 @@ class NodeRow {
   speed: number = -1;
   addr: string = '';
   selected: boolean = false;
+  /** 多选模式下该行是否被勾选 */
+  checked: boolean = false;
   moreLeft: number = 0;
   /** 订阅配额/到期展示文案（仅订阅分组头使用） */
   quotaText: string = '';
@@ -221,8 +223,11 @@ class NodeDataSource implements IDataSource {
     copy.nodeIndex = src.nodeIndex;
     copy.name = src.name;
     copy.delay = src.delay;
+    copy.delayTested = src.delayTested;
+    copy.speed = src.speed;
     copy.addr = src.addr;
     copy.selected = flag;
+    copy.checked = src.checked;
     copy.moreLeft = src.moreLeft;
     copy.quotaText = src.quotaText;
     this.rows[at] = copy;
@@ -276,6 +281,12 @@ struct Index {
   @State linkInput: string = '';
   @State subInput: string = '';
   @State testing: boolean = false;
+  /** 多选模式：节点行前置勾选框，工具条支持批量测延迟/删除/导出 */
+  @State multiMode: boolean = false;
+  /** 勾选节点的 Profile.id 集合（用 id 而非下标：删除/订阅刷新后下标会漂移） */
+  private checkedIds: Set<string> = new Set();
+  /** 勾选数量的响应式镜像：Set 本身不是 @State，工具条文案靠它刷新 */
+  @State checkedCount: number = 0;
   /** 连接/断开进行中：按钮立刻给出反馈，避免「点了没反应」的错觉 */
   @State busy: boolean = false;
   /** 测速进度：已测 / 待测 */
@@ -1091,7 +1102,8 @@ struct Index {
    */
   rowKey(row: NodeRow): string {
     return row.key + '|' + String(row.delay) + '|' + String(row.moreLeft) + '|' +
-      String(row.groupCount) + '|' + (row.selected ? '1' : '0') + '|' + (row.groupOpen ? 'o' : 'c');
+      String(row.groupCount) + '|' + (row.selected ? '1' : '0') + '|' +
+      (row.checked ? 'c' : 'u') + '|' + (row.groupOpen ? 'o' : 'c');
   }
 
   refreshRows(): void {
@@ -1136,6 +1148,7 @@ struct Index {
         row.speed = p.speed !== undefined ? p.speed : -1;
         row.addr = p.type.toUpperCase() + ' · ' + p.server + ':' + String(p.port);
         row.selected = index === this.selected;
+        row.checked = this.checkedIds.has(p.id);
         row.firstInBlock = false;
         row.lastInBlock = !hasMore && pos === shown.length - 1;
         rows.push(row);
@@ -2640,6 +2653,170 @@ struct Index {
       }
     }
     this.toast.showToast({ message: '已删除' });
+    this.reconnectSoon();
+  }
+
+  // ---------- 多选批量 ----------
+
+  /** 当前勾选节点对应的当前下标（id → 下标，删除/刷新后下标漂移也不影响）。 */
+  private checkedIndices(): number[] {
+    const out: number[] = [];
+    this.profiles.forEach((item: Profile, index: number) => {
+      if (this.checkedIds.has(item.id)) {
+        out.push(index);
+      }
+    });
+    return out;
+  }
+
+  /** 进入 / 退出多选；退出时清空勾选。 */
+  private toggleMultiMode(): void {
+    this.multiMode = !this.multiMode;
+    if (!this.multiMode) {
+      this.checkedIds.clear();
+      this.checkedCount = 0;
+    }
+    this.bump();
+  }
+
+  private toggleChecked(index: number): void {
+    const p: Profile | undefined = this.profiles[index];
+    if (p === undefined) {
+      return;
+    }
+    if (this.checkedIds.has(p.id)) {
+      this.checkedIds.delete(p.id);
+    } else {
+      this.checkedIds.add(p.id);
+    }
+    this.checkedCount = this.checkedIds.size;
+    this.bump();
+  }
+
+  /** 多选模式下点行是勾选，否则是选中节点。 */
+  private onNodeTap(row: NodeRow): void {
+    if (this.multiMode) {
+      this.toggleChecked(row.nodeIndex);
+    } else {
+      this.selectNode(row.nodeIndex);
+    }
+  }
+
+  /** 批量测延迟：复用通用并发池，按勾选集合跑。 */
+  private batchTestDelay(): void {
+    if (this.testing) {
+      return;
+    }
+    if (!this.running) {
+      this.toast.showToast({ message: '请先连接，内核起来后才能测速' });
+      return;
+    }
+    const indices: number[] = this.checkedIndices();
+    if (indices.length === 0) {
+      this.toast.showToast({ message: '未勾选节点' });
+      return;
+    }
+    this.confirmTest(indices.length, () => {
+      this.runIndicesTest(indices);
+    });
+  }
+
+  private async runIndicesTest(indices: number[]): Promise<void> {
+    this.testing = true;
+    this.testStop = false;
+    this.testDone = 0;
+    this.testTotal = indices.length;
+    this.testInfo = '已测 0 · 待测 ' + String(this.testTotal);
+    this.sortByDelay = false;
+    this.bump();
+    await this.runPool(indices, this.settings.testConcurrency);
+    const stopped: boolean = this.testStop;
+    this.testing = false;
+    this.testStop = false;
+    this.testInfo = '';
+    this.sortByDelay = true;
+    this.profiles = this.profiles.slice();
+    this.bump();
+    this.toast.showToast({ message: stopped ? '已停止测速' : '批量测速完成，已按延迟排序' });
+  }
+
+  /** 批量导出链接：拼进剪贴板；原始 link 缺失时按字段现场重建。 */
+  private batchExportLinks(): void {
+    const indices: number[] = this.checkedIndices();
+    if (indices.length === 0) {
+      this.toast.showToast({ message: '未勾选节点' });
+      return;
+    }
+    const lines: string[] = [];
+    let failed: number = 0;
+    indices.forEach((i: number) => {
+      const p: Profile = this.profiles[i];
+      let link: string = p.link;
+      if (link.length === 0) {
+        try {
+          link = ProxyLink.toLink(p);
+        } catch (err) {
+          failed = failed + 1;
+        }
+      }
+      if (link.length > 0) {
+        lines.push(link);
+      }
+    });
+    if (lines.length === 0) {
+      this.toast.showToast({ message: '勾选节点无可用链接' });
+      return;
+    }
+    const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, lines.join('\n'));
+    pasteboard.getSystemPasteboard().setDataSync(data);
+    this.toast.showToast({ message: '已复制 ' + String(lines.length) + ' 条链接' +
+      (failed > 0 ? '（' + String(failed) + ' 条无法生成）' : '') });
+  }
+
+  private batchDelete(): void {
+    const indices: number[] = this.checkedIndices();
+    if (indices.length === 0) {
+      this.toast.showToast({ message: '未勾选节点' });
+      return;
+    }
+    AlertDialog.show({
+      title: '批量删除',
+      message: '确定删除勾选的 ' + String(indices.length) + ' 个节点？此操作不可恢复。',
+      autoCancel: true,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: '删除',
+        action: () => {
+          this.batchDeleteNow();
+        }
+      }
+    });
+  }
+
+  private batchDeleteNow(): void {
+    const prev: Profile | undefined = this.selected >= 0 && this.selected < this.profiles.length
+      ? this.profiles[this.selected] : undefined;
+    const ids: Set<string> = new Set<string>();
+    this.checkedIds.forEach((id: string) => { ids.add(id); });
+    const list: Profile[] = this.profiles.filter((item: Profile) => !ids.has(item.id));
+    this.saveAll(list);
+    if (prev !== undefined) {
+      const hit: number = this.findProfileByIdentity(list, prev);
+      if (hit >= 0) {
+        this.selected = hit;
+      } else if (this.selected >= list.length) {
+        this.selected = list.length - 1;
+      }
+    }
+    this.checkedIds.clear();
+    this.checkedCount = 0;
+    this.multiMode = false;
+    this.bump();
+    this.toast.showToast({ message: '已删除 ' + String(ids.size) + ' 个节点' });
     this.reconnectSoon();
   }
 
@@ -4148,37 +4325,49 @@ struct Index {
 
   @Builder
   nodeRow(row: NodeRow) {
-    if (row.groupKey.length === 0) {
-      // 手动节点：一张一张独立的卡片
-      Column() {
-        this.nodeContent(row)
+    Row({ space: 10 }) {
+      if (this.multiMode) {
+        Row() {
+          Text(row.checked ? '✓' : '').fontSize(14).fontColor('#FFFFFF')
+        }
+        .width(22)
+        .height(22)
+        .borderRadius(11)
+        .justifyContent(FlexAlign.Center)
+        .backgroundColor(row.checked ? '#0A59F7' : '#FFFFFF')
+        .border({ width: 1.5, color: row.checked ? '#0A59F7' : '#B9C0CC' })
       }
-      .width('100%')
-      .padding(12)
-      .borderRadius(10)
-      .backgroundColor(row.selected ? '#EAF1FF' : '#F5F5F5')
-      .margin({ top: 8 })
-      .onClick(() => {
-        this.selectNode(row.nodeIndex);
-      })
-    } else {
-      // 订阅组：同组节点连成一整块，和上面的组头共用一块底色
-      Column() {
-        this.nodeContent(row)
+      if (row.groupKey.length === 0) {
+        // 手动节点：一张一张独立的卡片
+        Column() {
+          this.nodeContent(row)
+        }
+        .layoutWeight(1)
+        .padding(12)
+        .borderRadius(10)
+        .backgroundColor((row.selected || row.checked) ? '#EAF1FF' : '#F5F5F5')
+        .margin({ top: 8 })
+      } else {
+        // 订阅组：同组节点连成一整块，和上面的组头共用一块底色
+        Column() {
+          this.nodeContent(row)
+        }
+        .layoutWeight(1)
+        .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+        .borderRadius({
+          topLeft: row.firstInBlock ? 12 : 0,
+          topRight: row.firstInBlock ? 12 : 0,
+          bottomLeft: row.lastInBlock ? 12 : 0,
+          bottomRight: row.lastInBlock ? 12 : 0
+        })
+        .backgroundColor((row.selected || row.checked) ? '#E3ECFF' : '#F5F7FC')
       }
-      .width('100%')
-      .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-      .borderRadius({
-        topLeft: row.firstInBlock ? 12 : 0,
-        topRight: row.firstInBlock ? 12 : 0,
-        bottomLeft: row.lastInBlock ? 12 : 0,
-        bottomRight: row.lastInBlock ? 12 : 0
-      })
-      .backgroundColor(row.selected ? '#E3ECFF' : '#F5F7FC')
-      .onClick(() => {
-        this.selectNode(row.nodeIndex);
-      })
     }
+    .width('100%')
+    .alignItems(VerticalAlign.Center)
+    .onClick(() => {
+      this.onNodeTap(row);
+    })
   }
 
   @Builder
@@ -5586,7 +5775,38 @@ struct Index {
             .onClick(() => {
               this.testAll();
             })
+          Button(this.multiMode ? '退出多选' : '多选').layoutWeight(1).height(38).fontSize(14)
+            .backgroundColor(this.multiMode ? '#DCE7FF' : '#F0F0F0')
+            .fontColor('#0A59F7')
+            .enabled(!this.testing)
+            .onClick(() => {
+              this.toggleMultiMode();
+            })
         }.width('100%')
+
+        // 多选工具条：勾选数量 + 批量测延迟 / 导出 / 删除
+        if (this.multiMode) {
+          Row({ space: 8 }) {
+            Text('已选 ' + String(this.checkedCount) + ' 个')
+              .fontSize(14)
+              .fontColor('#2E2E2E')
+              .layoutWeight(1)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Button('测延迟').height(34).fontSize(13)
+              .backgroundColor('#2E7D32').fontColor('#FFFFFF')
+              .enabled(!this.testing)
+              .onClick(() => { this.batchTestDelay(); })
+            Button('导出').height(34).fontSize(13)
+              .backgroundColor('#0A59F7').fontColor('#FFFFFF')
+              .onClick(() => { this.batchExportLinks(); })
+            Button('删除').height(34).fontSize(13)
+              .backgroundColor('#E84026').fontColor('#FFFFFF')
+              .onClick(() => { this.batchDelete(); })
+          }
+          .width('100%')
+          .padding({ left: 4, right: 4, top: 8, bottom: 4 })
+        }
 
         List({ space: 0 }) {
           // LazyForEach：只创建屏幕内可见的行，几百个节点也不会拖慢主线程
