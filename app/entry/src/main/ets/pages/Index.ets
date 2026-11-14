@@ -5039,9 +5039,27 @@ struct Index {
             .fontColor('#5A5A5A')
             .width('100%')
           Row({ space: 8 }) {
-            this.chip('6', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 6 }); })
-            this.chip('12', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 12 }); })
-            this.chip('24', String(this.settings.testConcurrency), () => { this.patchSettings({ testConcurrency: 24 }); })
+            Text('6')
+              .fontSize(14)
+              .padding({ left: 13, right: 13, top: 8, bottom: 8 })
+              .borderRadius(8)
+              .backgroundColor(this.settings.testConcurrency === 6 ? '#EAF1FF' : '#F2F2F2')
+              .fontColor(this.settings.testConcurrency === 6 ? '#0A59F7' : '#333333')
+              .onClick(() => { this.patchSettings({ testConcurrency: 6 }); })
+            Text('12')
+              .fontSize(14)
+              .padding({ left: 13, right: 13, top: 8, bottom: 8 })
+              .borderRadius(8)
+              .backgroundColor(this.settings.testConcurrency === 12 ? '#EAF1FF' : '#F2F2F2')
+              .fontColor(this.settings.testConcurrency === 12 ? '#0A59F7' : '#333333')
+              .onClick(() => { this.patchSettings({ testConcurrency: 12 }); })
+            Text('24')
+              .fontSize(14)
+              .padding({ left: 13, right: 13, top: 8, bottom: 8 })
+              .borderRadius(8)
+              .backgroundColor(this.settings.testConcurrency === 24 ? '#EAF1FF' : '#F2F2F2')
+              .fontColor(this.settings.testConcurrency === 24 ? '#0A59F7' : '#333333')
+              .onClick(() => { this.patchSettings({ testConcurrency: 24 }); })
           }
           .width('100%')
 
@@ -5050,25 +5068,85 @@ struct Index {
             .fontColor('#5A5A5A')
             .width('100%')
           Row({ space: 8 }) {
-            this.chip('1 MB', this.settings.speedBytes === 1048576 ? '1 MB' : '', () => { this.patchSettings({ speedBytes: 1048576 }); })
-            this.chip('5 MB', this.settings.speedBytes === 5242880 ? '5 MB' : '', () => { this.patchSettings({ speedBytes: 5242880 }); })
-            this.chip('10 MB', this.settings.speedBytes === 10485760 ? '10 MB' : '', () => { this.patchSettings({ speedBytes: 10485760 }); })
+            Text('1 MB')
+              .fontSize(14)
+              .padding({ left: 13, right: 13, top: 8, bottom: 8 })
+              .borderRadius(8)
+              .backgroundColor(this.settings.speedBytes === 1048576 ? '#EAF1FF' : '#F2F2F2')
+              .fontColor(this.settings.speedBytes === 1048576 ? '#0A59F7' : '#333333')
+              .onClick(() => { this.patchSettings({ speedBytes: 1048576 }); })
+            Text('5 MB')
+              .fontSize(14)
+              .padding({ left: 13, right: 13, top: 8, bottom: 8 })
+              .borderRadius(8)
+              .backgroundColor(this.settings.speedBytes === 5242880 ? '#EAF1FF' : '#F2F2F2')
+              .fontColor(this.settings.speedBytes === 5242880 ? '#0A59F7' : '#333333')
+              .onClick(() => { this.patchSettings({ speedBytes: 5242880 }); })
+            Text('10 MB')
+              .fontSize(14)
+              .padding({ left: 13, right: 13, top: 8, bottom: 8 })
+              .borderRadius(8)
+              .backgroundColor(this.settings.speedBytes === 10485760 ? '#EAF1FF' : '#F2F2F2')
+              .fontColor(this.settings.speedBytes === 10485760 ? '#0A59F7' : '#333333')
+              .onClick(() => { this.patchSettings({ speedBytes: 10485760 }); })
           }
           .width('100%')
 
           // ---- 连接行为 ----
           this.settingSection('连接行为')
-          this.toggleRow('自动连接', '冷启动 / 掉线后自动重连', this.settings.autoConnect,
-            (v: boolean) => { this.patchSettings({ autoConnect: v }); })
-          this.toggleRow('故障转移', '当前节点无流量时自动切换到其他可用节点', this.settings.failover,
-            (v: boolean) => { this.patchSettings({ failover: v }); })
-          this.toggleRow('后台保活', '连接期间申请长时任务，降低后台被系统回收的概率', this.settings.keepAlive,
-            (v: boolean) => { this.patchSettings({ keepAlive: v }); })
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text('自动连接').fontSize(15).fontColor('#1A1A1A')
+              Text('冷启动 / 掉线后自动重连').fontSize(12).fontColor('#5A5A5A')
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Toggle({ type: ToggleType.Switch, isOn: this.settings.autoConnect })
+              .onChange((v: boolean) => { this.patchSettings({ autoConnect: v }); })
+          }
+          .width('100%')
+          .padding({ top: 6, bottom: 6 })
+
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text('故障转移').fontSize(15).fontColor('#1A1A1A')
+              Text('当前节点无流量时自动切换到其他可用节点').fontSize(12).fontColor('#5A5A5A')
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Toggle({ type: ToggleType.Switch, isOn: this.settings.failover })
+              .onChange((v: boolean) => { this.patchSettings({ failover: v }); })
+          }
+          .width('100%')
+          .padding({ top: 6, bottom: 6 })
+
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text('后台保活').fontSize(15).fontColor('#1A1A1A')
+              Text('连接期间申请长时任务，降低后台被系统回收的概率').fontSize(12).fontColor('#5A5A5A')
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Toggle({ type: ToggleType.Switch, isOn: this.settings.keepAlive })
+              .onChange((v: boolean) => { this.patchSettings({ keepAlive: v }); })
+          }
+          .width('100%')
+          .padding({ top: 6, bottom: 6 })
 
           // ---- 订阅 ----
           this.settingSection('订阅')
-          this.toggleRow('启动时自动更新', '打开应用后静默更新所有带链接的订阅分组', this.settings.autoUpdateOnStart,
-            (v: boolean) => { this.patchSettings({ autoUpdateOnStart: v }); })
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text('启动时自动更新').fontSize(15).fontColor('#1A1A1A')
+              Text('打开应用后静默更新所有带链接的订阅分组').fontSize(12).fontColor('#5A5A5A')
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Toggle({ type: ToggleType.Switch, isOn: this.settings.autoUpdateOnStart })
+              .onChange((v: boolean) => { this.patchSettings({ autoUpdateOnStart: v }); })
+          }
+          .width('100%')
+          .padding({ top: 6, bottom: 6 })
 
           // ---- 代理与分流 ----
           this.settingSection('代理与分流')
@@ -5175,25 +5253,6 @@ struct Index {
     })
   }
 
-  /** 设置页开关行：标题 + 说明 + 右侧 Switch。 */
-  @Builder
-  toggleRow(title: string, desc: string, isOn: boolean, onChange: (v: boolean) => void) {
-    Row({ space: 10 }) {
-      Column({ space: 2 }) {
-        Text(title).fontSize(15).fontColor('#1A1A1A')
-        Text(desc).fontSize(12).fontColor('#5A5A5A')
-      }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
-      Toggle({ type: ToggleType.Switch, isOn: isOn })
-        .onChange((v: boolean) => {
-          onChange(v);
-        })
-    }
-    .width('100%')
-    .padding({ top: 6, bottom: 6 })
-  }
-
   @Builder
   rulesPanel() {
     Column({ space: 10 }) {
@@ -5274,10 +5333,31 @@ struct Index {
         .fontSize(15)
         .fontWeight(FontWeight.Bold)
         .width('100%')
-      this.toggleRow('绕过中国大陆', '国内域名与 IP 直连，不走代理', this.bypassCnOn(),
-        (v: boolean) => { this.toggleBypassCn(v); })
-      this.toggleRow('拦截广告', 'category-ads-all 广告域名直接阻断', this.blockAdsOn(),
-        (v: boolean) => { this.toggleBlockAds(v); })
+      Row({ space: 10 }) {
+        Column({ space: 2 }) {
+          Text('绕过中国大陆').fontSize(15).fontColor('#1A1A1A')
+          Text('国内域名与 IP 直连，不走代理').fontSize(12).fontColor('#5A5A5A')
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Toggle({ type: ToggleType.Switch, isOn: this.bypassCnOn() })
+          .onChange((v: boolean) => { this.toggleBypassCn(v); })
+      }
+      .width('100%')
+      .padding({ top: 6, bottom: 6 })
+
+      Row({ space: 10 }) {
+        Column({ space: 2 }) {
+          Text('拦截广告').fontSize(15).fontColor('#1A1A1A')
+          Text('category-ads-all 广告域名直接阻断').fontSize(12).fontColor('#5A5A5A')
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Toggle({ type: ToggleType.Switch, isOn: this.blockAdsOn() })
+          .onChange((v: boolean) => { this.toggleBlockAds(v); })
+      }
+      .width('100%')
+      .padding({ top: 6, bottom: 6 })
 
       Text('直连域名（命中后直连）')
         .fontSize(14)
@@ -6060,16 +6140,18 @@ struct Index {
         this.drawer()
       }
 
+      // 设置页先挂载：它是各子面板（分应用/分流/Geo/日志/分组）的父层，
+      // 必须排在子面板之前，否则全屏白底会把子面板盖住，表现为「点了没反应」。
+      if (this.settingsPanel) {
+        this.settingsPanelView()
+      }
+
       if (this.rulePanel) {
         this.rulesPanel()
       }
 
       if (this.appScopePanel) {
         this.appScopePanelView()
-      }
-
-      if (this.settingsPanel) {
-        this.settingsPanelView()
       }
 
       if (this.geoPanel) {
