@@ -1,4 +1,4 @@
-# v2rayNG 鸿蒙版
+# V2rayM
 
 把 Android 上 [v2rayNG](https://github.com/2dust/v2rayNG) 的使用习惯搬到 HarmonyOS 上的原生客户端：
 **ArkTS 界面 + mihomo（Go）内核 + NAPI 桥接 + 系统 VPN 扩展**，不是套壳 WebView，也不依赖任何第三方 VPN App。
@@ -136,7 +136,7 @@ tools/                          命令行构建脚本
   - Releases 页（推荐）：每次 push 构建成功后由 Actions 自动发布到
     `https://github.com/ansun1714/v2rayng-hos/releases/tag/hap-latest`，
     资产固定叫 `entry-default-unsigned.hap`，正文里有大小、SHA256 与对应 run
-  - Actions 对应 run 的页面 → Artifacts → `v2rayng-ohos-unsigned-hap-api15`（保留 30 天，同一份产物打成 zip）
+  - Actions 对应 run 的页面 → Artifacts → `v2raym-ohos-unsigned-hap-api15`（保留 30 天，同一份产物打成 zip）
   - Release 里的 `hvigor-5.19.8` 是 **prerelease**，只放 CI 需要的 hvigor tarball，不是应用成品
 
 - **为什么一定没签名**：`app/build-profile.json5` 里 `signingConfigs` 是空数组，hvigor 只会产出未签名包

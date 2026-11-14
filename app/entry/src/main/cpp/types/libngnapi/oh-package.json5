@@ -1,7 +1,7 @@
 {
   "name": "libngnapi",
   "version": "1.0.0",
-  "description": "v2rayNG-HarmonyOS 代理内核 NAPI 桥",
+  "description": "V2rayM-HarmonyOS 代理内核 NAPI 桥",
   "main": "index.d.ts",
   "author": "",
   "license": "GPL-3.0",

@@ -2,19 +2,19 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "v2rayNG 鸿蒙版"
+      "value": "V2rayM"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "v2rayNG 鸿蒙版主界面"
+      "value": "V2rayM 主界面"
     },
     {
       "name": "EntryAbility_label",
-      "value": "v2rayNG"
+      "value": "V2rayM"
     },
     {
       "name": "vpn_desc",
-      "value": "v2rayNG VPN 服务"
+      "value": "V2rayM VPN 服务"
     },
     {
       "name": "pasteboard_reason",

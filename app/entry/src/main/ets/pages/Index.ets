@@ -1348,7 +1348,7 @@ struct Index {
     // 会被同一网络里的中间人读走，响应还能被改写。出口探测两个地址本来就是 https，
     // 测速走 NAPI 的 proxyDelay 不经过这里，因此不受影响。
     if (!url.toLowerCase().startsWith('https://')) {
-      hilog.error(0x0001, 'V2rayNG-UI', 'httpGet refused: not https');
+      hilog.error(0x0001, 'V2rayM-UI', 'httpGet refused: not https');
       return '';
     }
     const req = http.createHttp();
@@ -1358,11 +1358,11 @@ struct Index {
         connectTimeout: timeoutMs,
         readTimeout: timeoutMs,
         expectDataType: http.HttpDataType.STRING,
-        header: { 'User-Agent': 'v2rayNG-harmony/1.0' }
+        header: { 'User-Agent': 'V2rayM-harmony/1.0' }
       });
       if (resp.responseCode !== 200) {
         // 不打印 url：订阅链接里带 token，落到系统日志等于把凭据写进日志
-        hilog.error(0x0001, 'V2rayNG-UI', 'httpGet code=%{public}d', resp.responseCode);
+        hilog.error(0x0001, 'V2rayM-UI', 'httpGet code=%{public}d', resp.responseCode);
         FileStore.appendLog(this.filesDir, 'httpGet non-200: ' + String(resp.responseCode));
         return '';
       }
@@ -1375,7 +1375,7 @@ struct Index {
       return decoder.decodeToString(new Uint8Array(raw as ArrayBuffer));
     } catch (err) {
       const be = err as BusinessError;
-      hilog.error(0x0001, 'V2rayNG-UI', 'httpGet fail code=%{public}d msg=%{public}s',
+      hilog.error(0x0001, 'V2rayM-UI', 'httpGet fail code=%{public}d msg=%{public}s',
         be.code !== undefined ? be.code : -1, String(be.message));
       FileStore.appendLog(this.filesDir, 'httpGet err: code=' +
         String(be.code !== undefined ? be.code : -1) + ' msg=' + String(be.message));
@@ -1401,7 +1401,7 @@ struct Index {
         connectTimeout: timeoutMs,
         readTimeout: timeoutMs,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        header: { 'User-Agent': 'v2rayNG-harmony/1.0' }
+        header: { 'User-Agent': 'V2rayM-harmony/1.0' }
       });
       const ms: number = Date.now() - started;
       if (resp.responseCode !== 200) {
@@ -1435,7 +1435,7 @@ struct Index {
         method: http.RequestMethod.HEAD,
         connectTimeout: timeoutMs,
         readTimeout: timeoutMs,
-        header: { 'User-Agent': 'v2rayNG-harmony/1.0' }
+        header: { 'User-Agent': 'V2rayM-harmony/1.0' }
       });
       const code: number = resp.responseCode;
       return code === 200 || code === 206;
@@ -2713,14 +2713,14 @@ struct Index {
     }
     this.ruleMsg = '正在拉取规则订阅…';
     const body: string = await this.httpGet(url, 15000);
-    hilog.info(0x0000, 'V2rayNG-UI', 'rule fetched, bytes=%{public}d', body.length);
+    hilog.info(0x0000, 'V2rayM-UI', 'rule fetched, bytes=%{public}d', body.length);
     if (body.trim().length === 0) {
       this.ruleMsg = '拉取失败：没有收到内容（HTTP 未返回或链接不可达）';
       this.toast.showToast({ message: '规则拉取失败，检查链接或网络' });
       return;
     }
     const parsed: RuleItem[] = ConfigBuilder.parseRules(body, Index.targetHintFromUrl(url));
-    hilog.info(0x0000, 'V2rayNG-UI', 'rule parsed=%{public}d', parsed.length);
+    hilog.info(0x0000, 'V2rayM-UI', 'rule parsed=%{public}d', parsed.length);
     if (parsed.length === 0) {
       const head: string = body.substring(0, Math.min(40, body.length)).replace(/\s+/g, ' ');
       this.ruleMsg = '返回 ' + String(body.length) + ' 字节但无规则：' + head;
@@ -4015,7 +4015,7 @@ struct Index {
               this.drawerOpen = true;
             })
           Column({ space: 2 }) {
-            Text('v2rayNG 鸿蒙版').fontSize(21).fontWeight(FontWeight.Bold).fontColor('#FFFFFF')
+            Text('V2rayM').fontSize(21).fontWeight(FontWeight.Bold).fontColor('#FFFFFF')
             Text(this.summary).fontSize(13).fontColor('#FFE3E3')
             if (this.coreVersion.length > 0) {
               Text('内核 ' + this.coreVersion).fontSize(12).fontColor('#FFE3E3')

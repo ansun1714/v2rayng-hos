@@ -265,7 +265,7 @@ jobs:
       - name: Upload unsigned HAP
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayng-ohos-unsigned-hap-api${{ env.SDK_API }}
+          name: v2raym-ohos-unsigned-hap-api${{ env.SDK_API }}
           path: |
             out/*.hap
             out/SHA256SUMS.txt
@@ -294,7 +294,7 @@ jobs:
           rel_id="$(curl -sS "${auth[@]}" "$api/releases/tags/hap-latest" | jq -r '.id // empty')"
           if [ -z "$rel_id" ]; then
             echo "creating release hap-latest"
-            payload="$(jq -n --arg t "hap-latest" --arg n "v2rayNG 鸿蒙版 · 最新未签名 HAP（自动构建）" --arg b "$body" '{tag_name:$t,name:$n,body:$b,draft:false,prerelease:false}')"
+            payload="$(jq -n --arg t "hap-latest" --arg n "V2rayM · 最新未签名 HAP（自动构建）" --arg b "$body" '{tag_name:$t,name:$n,body:$b,draft:false,prerelease:false}')"
             rel_id="$(curl -sS "${auth[@]}" -H "Content-Type: application/json" -d "$payload" "$api/releases" | jq -r '.id')"
           else
             echo "updating release hap-latest (id=$rel_id)"

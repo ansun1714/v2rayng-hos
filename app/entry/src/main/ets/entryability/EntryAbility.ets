@@ -7,7 +7,7 @@ import { KeepAliveManager } from '../core/KeepAliveManager';
 import { FileStore } from '../core/FileStore';
 
 const DOMAIN: number = 0x0001;
-const TAG: string = 'V2rayNG';
+const TAG: string = 'V2rayM';
 const BUNDLE_NAME: string = 'com.maoxu.v2rayng';
 /** 看门狗 workId：固定值，重复 startWork 覆盖同 id 任务，天然幂等 */
 const WATCHDOG_WORK_ID: number = 1001;

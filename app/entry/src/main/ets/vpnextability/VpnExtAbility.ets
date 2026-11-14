@@ -7,7 +7,7 @@ import { FileStore } from '../core/FileStore';
 import { DelayReq, DelayRes, DelayBody, AppScope } from '../core/Model';
 
 const DOMAIN: number = 0x0001;
-const TAG: string = 'V2rayNG-VpnExt';
+const TAG: string = 'V2rayM-VpnExt';
 
 const TUN_IP: string = '172.19.0.1';
 const TUN_DNS: string = '172.19.0.2';

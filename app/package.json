@@ -1,1 +1,1 @@
-{"name":"v2rayng-ohos","version":"1.0.0","private":true,"dependencies":{"@ohos/hvigor":"^5.19.8","@ohos/hvigor-ohos-plugin":"^5.19.8"}}
+{"name":"v2raym-ohos","version":"1.0.0","private":true,"dependencies":{"@ohos/hvigor":"^5.19.8","@ohos/hvigor-ohos-plugin":"^5.19.8"}}
