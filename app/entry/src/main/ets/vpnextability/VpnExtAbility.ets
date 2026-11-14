@@ -286,6 +286,15 @@ export default class VpnExtAbility extends VpnExtensionAbility {
       }
 
       this.started = true;
+      // 内核版本写文件供界面「关于」展示：界面进程不在同一网络命名空间，也不便直接 dlopen 内核库
+      try {
+        const coreVer: string = NgCore.version();
+        if (coreVer !== undefined && coreVer.length > 0) {
+          FileStore.writeText(FileStore.coreVersionPath(filesDir), coreVer);
+        }
+      } catch (err) {
+        hilog.warn(DOMAIN, TAG, 'read core version failed: %{public}s', String(err));
+      }
       this.writeState(true, '已连接');
       FileStore.appendLog(filesDir, 'core started, state=running');
       this.startStatsLoop(filesDir);

@@ -6,7 +6,7 @@ import { vpnExtension, http, connection } from '@kit.NetworkKit';
 import { PromptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { ProxyLink } from '../core/ProxyLink';
-import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope } from '../core/Model';
+import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope, AppSettings } from '../core/Model';
 import { ConfigBuilder } from '../core/ConfigBuilder';
 import { FileStore } from '../core/FileStore';
 import { KeepAliveManager } from '../core/KeepAliveManager';
@@ -45,11 +45,6 @@ const SPEED_PROBES: string[] = [
   'https://speed.cloudflare.com/__down?bytes=1048576',
   'https://speed.hetzner.de/1MB.bin',
   'https://proof.ovh.net/files/1Mb.dat'
-];
-const SPEED_TESTS: string[] = [
-  'https://speed.cloudflare.com/__down?bytes=5242880',
-  'https://speed.hetzner.de/10MB.bin',
-  'https://proof.ovh.net/files/10Mb.dat'
 ];
 
 interface ExitGeo {
@@ -121,7 +116,9 @@ class NodeRow {
   nodeIndex: number = -1;
   name: string = '';
   delay: number = -1;
-  /** 下载测速结果（KB/s，-1 未测）；与延迟一起显示在节点行 */
+  /** 延迟测速是否跑过：false 显示「—」，true 且 delay<0 才显示红色 -1 */
+  delayTested: boolean = false;
+  /** 下载测速结果（KB/s，-1 未测，0 测过不通）；与延迟一起显示在节点行 */
   speed: number = -1;
   addr: string = '';
   selected: boolean = false;
@@ -317,6 +314,14 @@ struct Index {
   @State eSni: string = '';
   @State ePath: string = '';
   @State eHost: string = '';
+  @State eAlpn: string = '';
+  @State eInsecure: boolean = false;
+  @State eFingerprint: string = '';
+
+  // 测速偏好（并发 / 包大小）与内核版本
+  @State settingsPanel: boolean = false;
+  @State settings: AppSettings = { testConcurrency: 24, speedBytes: 5242880 };
+  @State coreVersion: string = '';
 
   // 订阅分组改名：key = 订阅 URL，value = 用户自己起的名字（存 group-names.json）
   @State renameKey: string = '';
@@ -621,6 +626,12 @@ struct Index {
       if (p.network === undefined) {
         p.network = 'tcp';
       }
+      if (p.alpn === undefined) {
+        p.alpn = '';
+      }
+      if (p.allowInsecure === undefined) {
+        p.allowInsecure = false;
+      }
       list.push(p);
     });
     this.profiles = list;
@@ -642,6 +653,10 @@ struct Index {
     if (this.ruleUrl.length === 0) {
       this.syncRuleUrlFromStore();
     }
+    // 测速偏好（并发 / 包大小）
+    this.settings = FileStore.loadSettings(this.filesDir);
+    // 内核版本：扩展进程启动时写入，界面只读展示
+    this.coreVersion = FileStore.readText(FileStore.coreVersionPath(this.filesDir)).trim();
   }
 
   seedDefaultNodes(): void {
@@ -1010,6 +1025,7 @@ struct Index {
         row.nodeIndex = index;
         row.name = p.name;
         row.delay = p.delay;
+        row.delayTested = p.delayTested !== undefined ? p.delayTested : false;
         row.speed = p.speed !== undefined ? p.speed : -1;
         row.addr = p.type.toUpperCase() + ' · ' + p.server + ':' + String(p.port);
         row.selected = index === this.selected;
@@ -1073,20 +1089,24 @@ struct Index {
     return result;
   }
 
-  /** 组内按延迟从低到高排；没测出结果（-1）的沉到组尾，其余保持原相对顺序。 */
+  /** 组内按延迟从低到高排；没测出结果（-1）或带宽测速失败的沉到组尾，其余保持原相对顺序。 */
   sortIndices(group: NodeGroup): void {
     if (!this.sortByDelay || group.indices.length < 2) {
       return;
     }
     const origin: number[] = group.indices.slice();
-    // 原位置查表：392 个节点时每次比较都做 indexOf 会把排序拖成 O(n² log n)
+    // 原位置查表：几百个节点时每次比较都做 indexOf 会把排序拖成 O(n² log n)
     const pos: Map<number, number> = new Map<number, number>();
     origin.forEach((value: number, at: number) => {
       pos.set(value, at);
     });
     group.indices.sort((a: number, b: number) => {
-      const da: number = this.profiles[a].delay >= 0 ? this.profiles[a].delay : 999999;
-      const db: number = this.profiles[b].delay >= 0 ? this.profiles[b].delay : 999999;
+      // 可用节点按延迟升序；测速不通的（延迟 -1 或带宽测速失败 speed=0）
+      // 一律沉到组尾，用 999999 统一兜住，组内相对顺序仍按原位置稳定
+      const pa0: Profile = this.profiles[a];
+      const pb0: Profile = this.profiles[b];
+      const da: number = (pa0.delay >= 0 && pa0.speed !== 0) ? pa0.delay : 999999;
+      const db: number = (pb0.delay >= 0 && pb0.speed !== 0) ? pb0.delay : 999999;
       if (da !== db) {
         return da - db;
       }
@@ -1302,6 +1322,27 @@ struct Index {
     });
   }
 
+  /** 复制节点分享链接到剪贴板；原始 link 缺失时按字段现场重建。 */
+  copyLink(index: number): void {
+    const p: Profile = this.profiles[index];
+    let link: string = p.link;
+    if (link.length === 0) {
+      try {
+        link = ProxyLink.toLink(p);
+      } catch (err) {
+        this.toast.showToast({ message: '该节点无法生成链接' });
+        return;
+      }
+    }
+    if (link.length === 0) {
+      this.toast.showToast({ message: '该节点无法生成链接' });
+      return;
+    }
+    const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, link);
+    pasteboard.getSystemPasteboard().setDataSync(data);
+    this.toast.showToast({ message: '链接已复制' });
+  }
+
   async httpGet(url: string, timeoutMs: number): Promise<string> {
     // 兜底：所有拉取一律只走 https。订阅与规则链接走明文时 token 和节点凭据
     // 会被同一网络里的中间人读走，响应还能被改写。出口探测两个地址本来就是 https，
@@ -1410,6 +1451,18 @@ struct Index {
    * 并发 HEAD 三个小文件候选，取第一个 200 的；全都不通时再顺序 GET 兜底
    * （有些 CDN 不接受 HEAD）。
    */
+  /** 按当前测速包大小设置，返回第 ti 个候选端点的计时下载地址。 */
+  private speedTestUrl(ti: number): string {
+    const n: number = this.settings.speedBytes;
+    if (ti === 0) {
+      return 'https://speed.cloudflare.com/__down?bytes=' + String(n);
+    }
+    if (ti === 1) {
+      return n >= 10485760 ? 'https://speed.hetzner.de/10MB.bin' : 'https://speed.hetzner.de/1MB.bin';
+    }
+    return n >= 10485760 ? 'https://proof.ovh.net/files/10Mb.dat' : 'https://proof.ovh.net/files/1Mb.dat';
+  }
+
   private async pickSpeedIndex(): Promise<number> {
     const a: Promise<boolean> = this.httpHead(SPEED_PROBES[0], 4000);
     const b: Promise<boolean> = this.httpHead(SPEED_PROBES[1], 4000);
@@ -1417,16 +1470,15 @@ struct Index {
     const ok: boolean[] = await Promise.all([a, b, c]);
     for (let i = 0; i < ok.length; i++) {
       if (ok[i]) {
-        FileStore.appendLog(this.filesDir, 'speedtest endpoint #' + String(i) + ': ' + SPEED_TESTS[i]);
+        FileStore.appendLog(this.filesDir, 'speedtest endpoint #' + String(i) + ': ' + this.speedTestUrl(i));
         return i;
       }
     }
     FileStore.appendLog(this.filesDir, 'speedtest: no endpoint passed HEAD, try GET fallback');
-    for (let i = 0; i < SPEED_PROBES.length; i++) {
-      const small: number[] = await this.httpGetBytes(SPEED_PROBES[i], 8000);
-      if (small[0] > 0) {
-        return i;
-      }
+    // 只试第一个端点、10s 上界：三个都轮流试要 24s，用户等不起（真机 09:48 实测 28s 才出结果）
+    const small: number[] = await this.httpGetBytes(SPEED_PROBES[0], 10000);
+    if (small[0] > 0) {
+      return 0;
     }
     return -1;
   }
@@ -1455,27 +1507,23 @@ struct Index {
     try {
       const ti: number = await this.pickSpeedIndex();
       if (ti < 0) {
-        this.speedInfo = '测速失败';
-        FileStore.appendLog(this.filesDir, 'speedtest fail: ' + name + ' (no reachable endpoint)');
-        this.toast.showToast({ message: '测速失败：三个测速端点都不可达' });
+        this.markSpeedFail(idx, name, 'no reachable endpoint');
         return;
       }
       // 预热：先把 TCP/TLS 慢启动跑掉，这一枪不计时
       await this.httpGetBytes(SPEED_PROBES[ti], 12000);
-      let got: number[] = await this.httpGetBytes(SPEED_TESTS[ti], 20000);
+      let got: number[] = await this.httpGetBytes(this.speedTestUrl(ti), 20000);
       if (got[0] <= 0) {
         // 大文件超时（慢节点下 5MB 可能读不完）：退回小文件计时，宁可精度低也别没结果
         got = await this.httpGetBytes(SPEED_PROBES[ti], 12000);
       }
       const bytes: number = got[0];
-      const ms: number = got[1];
-      if (bytes <= 0 || ms <= 0) {
-        this.speedInfo = '测速失败';
-        FileStore.appendLog(this.filesDir, 'speedtest fail: ' + name + ' (download timeout)');
-        this.toast.showToast({ message: '测速失败：下载没有完成' });
+      const ms2: number = got[1];
+      if (bytes <= 0 || ms2 <= 0) {
+        this.markSpeedFail(idx, name, 'download timeout');
         return;
       }
-      const kbPerSec: number = Math.round(bytes / 1024 * 1000 / ms);
+      const kbPerSec: number = Math.round(bytes / 1024 * 1000 / ms2);
       // 选中节点可能在测速期间被切走：只回写到发起时的那个节点
       for (let i = 0; i < this.profiles.length; i++) {
         const p: Profile = this.profiles[i];
@@ -1500,10 +1548,32 @@ struct Index {
     if (kb < 0) {
       return '';
     }
+    if (kb === 0) {
+      return '不通';
+    }
     if (kb >= 1024) {
       return (Math.round(kb / 1024 * 10) / 10).toFixed(1) + 'MB/s';
     }
     return String(kb) + 'KB/s';
+  }
+
+  /**
+   * 测速失败的节点留下 0 标记（区别于 -1 未测）：真机 11-14 09:48 那个
+   * 台湾节点能握手、出口探测第 5 枪也能通，但累计下行只有 15KB、三个测速
+   * 端点全挂 —— 这种「能连不能跑」的节点必须能在列表里一眼认出来。
+   */
+  private markSpeedFail(idx: number, name: string, reason: string): void {
+    for (let i = 0; i < this.profiles.length; i++) {
+      if (i === idx && this.profiles[i].name === name) {
+        this.profiles[i].speed = 0;
+        break;
+      }
+    }
+    FileStore.saveProfiles(this.filesDir, this.profiles);
+    this.bump();
+    this.speedInfo = '不通';
+    FileStore.appendLog(this.filesDir, 'speedtest fail: ' + name + ' (' + reason + ')');
+    this.toast.showToast({ message: name + ' 测速不通' });
   }
 
   /**
@@ -2100,7 +2170,7 @@ struct Index {
     // 测速过程中先不排序，否则每测出一个结果整组就跳一次，根本看不清
     this.sortByDelay = false;
     this.bump();
-    await this.runPool(group.indices, Index.TEST_CONCURRENCY);
+    await this.runPool(group.indices, this.settings.testConcurrency);
     this.testing = false;
     this.testInfo = '';
     this.sortByDelay = true;
@@ -2109,9 +2179,6 @@ struct Index {
     this.bump();
     this.toast.showToast({ message: '本组测速完成，已按延迟排序' });
   }
-
-  /** 测速并发上限：内核侧是 goroutine，这里控制同时排队请求数。 */
-  static TEST_CONCURRENCY: number = 24;
 
   /** 并发池：固定 concurrency 个 worker 从队列里取节点去测，测完更新进度。 */
   async runPool(indices: number[], concurrency: number): Promise<void> {
@@ -2178,6 +2245,9 @@ struct Index {
     this.eSni = p.sni;
     this.ePath = p.wsPath;
     this.eHost = p.wsHost;
+    this.eAlpn = p.alpn;
+    this.eInsecure = p.allowInsecure === true;
+    this.eFingerprint = p.fingerprint;
   }
 
   addNew(): void {
@@ -2195,6 +2265,9 @@ struct Index {
     this.eSni = '';
     this.ePath = '';
     this.eHost = '';
+    this.eAlpn = '';
+    this.eInsecure = false;
+    this.eFingerprint = '';
   }
 
   closeEdit(): void {
@@ -2234,6 +2307,10 @@ struct Index {
     p.sni = this.eSni.trim();
     p.wsPath = this.ePath;
     p.wsHost = this.eHost.trim();
+    p.alpn = this.eAlpn.trim();
+    p.allowInsecure = this.eInsecure;
+    p.fingerprint = this.eFingerprint;
+    p.link = ProxyLink.toLink(p);
     p.delay = -1;
     const wanted: string = this.eName.trim().length > 0 ? this.eName.trim() : (p.server + ':' + p.port);
     if (isNew) {
@@ -2292,6 +2369,8 @@ struct Index {
     // 回填延迟。批量测速时由 runPool 每几个节点统一刷新一次列表，
     // 单点测速则立刻刷新。
     this.profiles[index].delay = delay;
+    // 跑过就算测过：delay 仍为 -1 时，列表会显示红色 -1 而不是「—」
+    this.profiles[index].delayTested = true;
     if (!silent) {
       this.bump();
     }
@@ -2333,7 +2412,7 @@ struct Index {
     for (let i = 0; i < this.profiles.length; i++) {
       all.push(i);
     }
-    await this.runPool(all, Index.TEST_CONCURRENCY);
+    await this.runPool(all, this.settings.testConcurrency);
     this.testing = false;
     this.testInfo = '';
     this.sortByDelay = true;
@@ -2363,7 +2442,9 @@ struct Index {
 
   static delayText(value: number): string {
     if (value === undefined || value === null || value < 0) {
-      return '—';
+      // 测速不通统一显示原始值 -1（红色，见节点行 fontColor），比「—」更直白，
+      // 也和排序里「-1 沉底」的规则对得上
+      return '-1';
     }
     return String(value) + ' ms';
   }
@@ -2404,6 +2485,19 @@ struct Index {
     FileStore.appendLog(this.filesDir, 'app scope saved: mode=' + this.appMode +
       ' packages=' + String(pkgs.length));
     this.toast.showToast({ message: '已保存，重新连接后生效' });
+  }
+
+  openSettings(): void {
+    this.settings = FileStore.loadSettings(this.filesDir);
+    this.settingsPanel = true;
+    this.drawerOpen = false;
+  }
+
+  saveSettingsConfig(): void {
+    FileStore.saveSettings(this.filesDir, this.settings);
+    FileStore.appendLog(this.filesDir, 'settings saved: concurrency=' +
+      String(this.settings.testConcurrency) + ' speedBytes=' + String(this.settings.speedBytes));
+    this.toast.showToast({ message: '已保存' });
   }
 
   openRules(): void {
@@ -2950,6 +3044,27 @@ struct Index {
 
           if (this.eTls) {
             this.field('SNI', this.eSni, (v: string) => { this.eSni = v; })
+            Row({ space: 8 }) {
+              Text('指纹').fontSize(15).width(80).fontColor('#4A4A4A')
+              Scroll() {
+                Row({ space: 8 }) {
+                  this.chip('默认', this.eFingerprint, () => { this.eFingerprint = ''; })
+                  this.chip('chrome', this.eFingerprint, () => { this.eFingerprint = 'chrome'; })
+                  this.chip('edge', this.eFingerprint, () => { this.eFingerprint = 'edge'; })
+                  this.chip('safari', this.eFingerprint, () => { this.eFingerprint = 'safari'; })
+                  this.chip('ios', this.eFingerprint, () => { this.eFingerprint = 'ios'; })
+                  this.chip('android', this.eFingerprint, () => { this.eFingerprint = 'android'; })
+                }
+              }.scrollable(ScrollDirection.Horizontal).layoutWeight(1)
+            }.width('100%')
+            this.field('ALPN', this.eAlpn, (v: string) => { this.eAlpn = v; })
+            Row({ space: 8 }) {
+              Text('不安全证书').fontSize(15).width(80).fontColor('#4A4A4A')
+              Toggle({ type: ToggleType.Switch, isOn: this.eInsecure })
+                .onChange((on: boolean) => {
+                  this.eInsecure = on;
+                })
+            }.width('100%')
           }
           if (this.eNetwork === 'ws') {
             this.field('WS 路径', this.ePath, (v: string) => { this.ePath = v; })
@@ -2983,6 +3098,16 @@ struct Index {
   @Builder
   nodeSwipe(index: number) {
     Row() {
+      Button('复制')
+        .height('100%')
+        .width(92)
+        .fontSize(15)
+        .borderRadius(0)
+        .backgroundColor('#2E7D32')
+        .fontColor('#FFFFFF')
+        .onClick(() => {
+          this.copyLink(index);
+        })
       Button('编辑')
         .height('100%')
         .width(92)
@@ -3015,14 +3140,21 @@ struct Index {
         Text(row.name).fontSize(17).maxLines(1).layoutWeight(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
 
-        Text(Index.delayText(row.delay))
+        // 三种状态分开显示：
+        //   测过不通（带宽测速失败或延迟测速失败）→ 红色 -1
+        //   测过且通 → 延迟毫秒（<1500ms 绿色）
+        //   没测过 → 灰色「—」，不标 -1，避免 861 个节点满屏红色
+        Text((row.speed === 0 || (row.delayTested && row.delay < 0)) ? '-1' :
+          (row.delay >= 0 ? String(row.delay) + ' ms' : '—'))
           .fontSize(15)
-          .fontColor(row.delay >= 0 && row.delay < 1500 ? '#2E7D32' : '#8A8A8A')
+          .fontColor((row.speed === 0 || (row.delayTested && row.delay < 0)) ? '#D93026' :
+            (row.delay >= 0 && row.delay < 1500 ? '#2E7D32' : '#8A8A8A'))
           .onClick(() => {
             this.testOne(row.nodeIndex);
           })
 
-        if (row.speed >= 0) {
+        // 带宽测速成功才额外显示下降速率；不通的情况上面已经用 -1 表示了
+        if (row.speed > 0) {
           Text('↓' + Index.speedText(row.speed))
             .fontSize(13)
             .fontColor('#0A59F7')
@@ -3302,6 +3434,16 @@ struct Index {
           .fontSize(13)
           .fontColor('#5A5A5A')
 
+        Button('设置 · 测速选项')
+          .width('100%')
+          .height(44)
+          .fontSize(15)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.openSettings();
+          })
+
         Button('设置 · 分应用代理')
           .width('100%')
           .height(44)
@@ -3426,6 +3568,64 @@ struct Index {
       Text('改动后需要重新连接代理才会生效。模式为「全部走代理」时名单不生效。')
         .fontSize(12)
         .fontColor('#B26A00')
+
+      Blank()
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+    .backgroundColor('#FFFFFF')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  settingsPanelView() {
+    Column({ space: 12 }) {
+      Row({ space: 8 }) {
+        Button('返回')
+          .width(76)
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#F0F0F0')
+          .fontColor('#333333')
+          .onClick(() => {
+            this.settingsPanel = false;
+          })
+        Text('测速选项')
+          .fontSize(19)
+          .fontWeight(FontWeight.Bold)
+          .layoutWeight(1)
+        Button('保存')
+          .width(84)
+          .height(38)
+          .fontSize(14)
+          .backgroundColor('#0A59F7')
+          .fontColor('#FFFFFF')
+          .onClick(() => {
+            this.saveSettingsConfig();
+          })
+      }
+      .width('100%')
+
+      Text('延迟测速并发：同时发起的测速请求数。并发太高可能被节点限流，太低则整组测速慢。')
+        .fontSize(13)
+        .fontColor('#5A5A5A')
+      Row({ space: 8 }) {
+        this.chip('6', String(this.settings.testConcurrency), () => { this.settings = { testConcurrency: 6, speedBytes: this.settings.speedBytes }; })
+        this.chip('12', String(this.settings.testConcurrency), () => { this.settings = { testConcurrency: 12, speedBytes: this.settings.speedBytes }; })
+        this.chip('24', String(this.settings.testConcurrency), () => { this.settings = { testConcurrency: 24, speedBytes: this.settings.speedBytes }; })
+      }
+      .width('100%')
+
+      Text('带宽测速包大小：下载文件越大测速越准；慢节点建议选小一档，避免大文件读不完超时。')
+        .fontSize(13)
+        .fontColor('#5A5A5A')
+      Row({ space: 8 }) {
+        this.chip('1 MB', this.settings.speedBytes === 1048576 ? '1 MB' : '', () => { this.settings = { testConcurrency: this.settings.testConcurrency, speedBytes: 1048576 }; })
+        this.chip('5 MB', this.settings.speedBytes === 5242880 ? '5 MB' : '', () => { this.settings = { testConcurrency: this.settings.testConcurrency, speedBytes: 5242880 }; })
+        this.chip('10 MB', this.settings.speedBytes === 10485760 ? '10 MB' : '', () => { this.settings = { testConcurrency: this.settings.testConcurrency, speedBytes: 10485760 }; })
+      }
+      .width('100%')
 
       Blank()
     }
@@ -3817,6 +4017,9 @@ struct Index {
           Column({ space: 2 }) {
             Text('v2rayNG 鸿蒙版').fontSize(21).fontWeight(FontWeight.Bold).fontColor('#FFFFFF')
             Text(this.summary).fontSize(13).fontColor('#FFE3E3')
+            if (this.coreVersion.length > 0) {
+              Text('内核 ' + this.coreVersion).fontSize(12).fontColor('#FFE3E3')
+            }
           }.alignItems(HorizontalAlign.Start).layoutWeight(1)
         }
         .width('100%')
@@ -3876,10 +4079,10 @@ struct Index {
                 })
               Text(this.speedBusy ? '测速中' : (this.speedInfo.length > 0 ? this.speedInfo : '带宽测速'))
                 .fontSize(12)
-                .fontColor('#0A59F7')
+                .fontColor(this.speedInfo === '不通' ? '#D93026' : '#0A59F7')
                 .padding({ left: 8, right: 8, top: 4, bottom: 4 })
                 .borderRadius(6)
-                .backgroundColor('#DCE7FF')
+                .backgroundColor(this.speedInfo === '不通' ? '#FBE3E2' : '#DCE7FF')
                 .onClick(() => {
                   if (!this.speedBusy) {
                     this.speedTestCurrent();
@@ -4012,6 +4215,10 @@ struct Index {
 
       if (this.appScopePanel) {
         this.appScopePanelView()
+      }
+
+      if (this.settingsPanel) {
+        this.settingsPanelView()
       }
 
       if (this.rulePanel && this.ruleEditing >= 0) {

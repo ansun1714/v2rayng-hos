@@ -20,6 +20,8 @@ export class ProxySpec {
   fingerprint: string = '';
   realityPbk: string = '';
   realitySid: string = '';
+  alpn: string = '';       // TLS ALPN，逗号分隔，如 h2,http/1.1
+  allowInsecure: boolean = false;
   link: string = '';
 }
 
@@ -47,8 +49,12 @@ export class Profile {
   fingerprint: string = '';
   realityPbk: string = '';
   realitySid: string = '';
-  delay: number = -1;   // 测速结果（毫秒），-1 未测
-  speed: number = -1;   // 下载测速结果（KB/s），-1 未测
+  alpn: string = '';
+  allowInsecure: boolean = false;
+  delay: number = -1;   // 测速结果（毫秒），-1 未测/不通
+  /** 延迟测速是否跑过：未测显示「—」，测过不通才显示红色 -1 */
+  delayTested: boolean = false;
+  speed: number = -1;   // 下载测速结果（KB/s），-1 未测，0 测过不通
   subId: string = '';   // 来源订阅链接，空表示手动/内置
 }
 
@@ -56,6 +62,12 @@ export class Profile {
 export interface AppScope {
   mode: string;         // all | allow | block
   packages: string[];   // 包名列表（allow 用作白名单，block 用作黑名单）
+}
+
+/** 测速相关偏好：延迟测速并发上限、带宽测速下载字节数。落盘 settings.json。 */
+export interface AppSettings {
+  testConcurrency: number;
+  speedBytes: number;
 }
 
 export class CoreState {

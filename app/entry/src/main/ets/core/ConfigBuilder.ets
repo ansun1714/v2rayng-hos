@@ -384,6 +384,16 @@ export class ConfigBuilder {
           lines.push('      short-id: ' + ConfigBuilder.quote(profile.realitySid));
         }
       }
+      if (profile.alpn.length > 0) {
+        const alpnItems: string[] = profile.alpn.split(',').map((a: string) => a.trim())
+          .filter((a: string) => a.length > 0);
+        if (alpnItems.length > 0) {
+          lines.push('    alpn: [' + alpnItems.map((a: string) => ConfigBuilder.quote(a)).join(', ') + ']');
+        }
+      }
+      if (profile.allowInsecure === true) {
+        lines.push('    skip-cert-verify: true');
+      }
     }
     return lines.join('\n');
   }

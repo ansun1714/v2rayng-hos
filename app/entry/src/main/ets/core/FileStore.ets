@@ -4,7 +4,7 @@
 import { fileIo } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { resourceManager } from '@kit.LocalizationKit';
-import { AppScope, Profile, RuleItem } from './Model';
+import { AppScope, AppSettings, Profile, RuleItem } from './Model';
 
 /** state.json 中由 UI 进程维护的用户意图标记（旧版本文件里没有，按 false 处理）。 */
 interface StateFlag {
@@ -301,6 +301,40 @@ export class FileStore {
 
   static saveAppScope(filesDir: string, scope: AppScope): void {
     FileStore.writeText(FileStore.appScopePath(filesDir), JSON.stringify(scope));
+  }
+
+  /** 测速偏好（并发 / 包大小）落盘 settings.json。 */
+  static settingsPath(filesDir: string): string {
+    return FileStore.ensureDir(filesDir) + '/settings.json';
+  }
+
+  static loadSettings(filesDir: string): AppSettings {
+    const fallback: AppSettings = { testConcurrency: 24, speedBytes: 5242880 };
+    const text: string = FileStore.readText(FileStore.settingsPath(filesDir));
+    if (text.length === 0) {
+      return fallback;
+    }
+    try {
+      const st: AppSettings = JSON.parse(text) as AppSettings;
+      if (st.testConcurrency === undefined || st.testConcurrency === null || st.testConcurrency < 1) {
+        st.testConcurrency = fallback.testConcurrency;
+      }
+      if (st.speedBytes === undefined || st.speedBytes === null || st.speedBytes < 1048576) {
+        st.speedBytes = fallback.speedBytes;
+      }
+      return st;
+    } catch (err) {
+      return fallback;
+    }
+  }
+
+  static saveSettings(filesDir: string, settings: AppSettings): void {
+    FileStore.writeText(FileStore.settingsPath(filesDir), JSON.stringify(settings));
+  }
+
+  /** 内核版本：扩展进程启动时写入，界面进程读取展示。 */
+  static coreVersionPath(filesDir: string): string {
+    return FileStore.ensureDir(filesDir) + '/core-version.txt';
   }
 
   /** 分流规则：用户可手动改、从文件导入、从网址订阅覆盖。 */

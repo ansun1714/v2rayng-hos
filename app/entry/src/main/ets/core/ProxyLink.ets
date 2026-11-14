@@ -58,6 +58,8 @@ export class ProxyLink {
     p.fingerprint = spec.fingerprint;
     p.realityPbk = spec.realityPbk;
     p.realitySid = spec.realitySid;
+    p.alpn = spec.alpn;
+    p.allowInsecure = spec.allowInsecure;
     p.subId = subId;
     return p;
   }
@@ -175,6 +177,15 @@ export class ProxyLink {
     if (sid !== undefined) {
       spec.realitySid = sid;
     }
+    const alpn: string | undefined = parts.query.get('alpn');
+    if (alpn !== undefined) {
+      spec.alpn = alpn;
+    }
+    const insecure: string | undefined = parts.query.get('allowInsecure')
+      ?? parts.query.get('insecure');
+    if (insecure !== undefined) {
+      spec.allowInsecure = insecure === '1' || insecure.toLowerCase() === 'true';
+    }
   }
 
   static parseVmess(link: string): ProxySpec {
@@ -194,6 +205,7 @@ export class ProxyLink {
     spec.wsPath = json.path ?? '';
     spec.wsHost = json.host ?? '';
     spec.fingerprint = json.fp ?? '';
+    spec.alpn = json.alpn ?? '';
     spec.name = (json.ps !== undefined && json.ps.length > 0) ? json.ps : (spec.server + ':' + spec.port);
     spec.link = link;
     if (spec.server.length === 0) {
@@ -283,5 +295,76 @@ export class ProxyLink {
       throw new Error('ss 链接解析失败');
     }
     return spec;
+  }
+
+  /** 把节点字段编码成 base64 字符串（vmess / ss 凭据用）。 */
+  private static b64encode(text: string): string {
+    const enc: util.TextEncoder = util.TextEncoder.create('utf-8');
+    const bytes: Uint8Array = enc.encodeInto(text);
+    const helper: util.Base64Helper = new util.Base64Helper();
+    const b64: Uint8Array = helper.encodeSync(bytes);
+    const dec: util.TextDecoder = util.TextDecoder.create('iso8859-1');
+    return dec.decodeToString(b64);
+  }
+
+  /** 拼 vless / trojan 通用的 ?type=...&... 查询串；空值不写。 */
+  private static commonQuery(p: Profile): string {
+    const q: string[] = [];
+    const add = (k: string, v: string): void => {
+      if (v !== undefined && v.length > 0) {
+        q.push(k + '=' + encodeURIComponent(v));
+      }
+    };
+    add('type', p.network);
+    if (p.tls) {
+      add('security', p.realityPbk.length > 0 ? 'reality' : 'tls');
+      add('sni', p.sni);
+      add('fp', p.fingerprint);
+      add('pbk', p.realityPbk);
+      add('sid', p.realitySid);
+      add('alpn', p.alpn);
+      if (p.allowInsecure) {
+        q.push('allowInsecure=1');
+      }
+    }
+    if (p.network === 'ws') {
+      add('path', p.wsPath);
+      add('host', p.wsHost);
+    } else if (p.network === 'grpc') {
+      add('serviceName', p.grpcService);
+    }
+    add('flow', p.flow);
+    return q.length > 0 ? '?' + q.join('&') : '';
+  }
+
+  /**
+   * 按节点字段反向生成分享链接（用于复制 / 分享）。
+   * vmess 的字段组合在本工程内无法完全无损重建，优先回退导入时保留的原始 link。
+   */
+  static toLink(p: Profile): string {
+    const name: string = encodeURIComponent(p.name);
+    if (p.type === 'vmess') {
+      if (p.link.length > 0 && p.link.startsWith('vmess://')) {
+        return p.link;
+      }
+      const obj: VmessJson = {
+        v: '2', ps: p.name, add: p.server, port: String(p.port), id: p.uuid,
+        aid: String(p.alterId), scy: p.cipher, net: p.network, type: p.network,
+        host: p.wsHost, path: p.wsPath, tls: p.tls ? 'tls' : '', sni: p.sni,
+        alpn: p.alpn, fp: p.fingerprint
+      };
+      return 'vmess://' + ProxyLink.b64encode(JSON.stringify(obj)) + '#' + name;
+    }
+    if (p.type === 'ss') {
+      const cred: string = ProxyLink.b64encode(p.cipher + ':' + p.password);
+      return 'ss://' + cred + '@' + p.server + ':' + String(p.port) + '#' + name;
+    }
+    if (p.type === 'trojan') {
+      return 'trojan://' + encodeURIComponent(p.password) + '@' + p.server + ':' +
+        String(p.port) + ProxyLink.commonQuery(p) + '#' + name;
+    }
+    // vless（默认）
+    return 'vless://' + encodeURIComponent(p.uuid) + '@' + p.server + ':' +
+      String(p.port) + ProxyLink.commonQuery(p) + '#' + name;
   }
 }
