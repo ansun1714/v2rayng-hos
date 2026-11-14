@@ -45,6 +45,7 @@ export class ProxyLink {
     p.server = spec.server;
     p.port = spec.port;
     p.uuid = spec.uuid;
+    p.username = spec.username;
     p.password = spec.password;
     p.cipher = spec.cipher;
     p.alterId = spec.alterId;
@@ -78,6 +79,12 @@ export class ProxyLink {
     if (text.startsWith('ss://')) {
       return ProxyLink.parseSs(text);
     }
+    if (text.startsWith('socks5://') || text.startsWith('socks://')) {
+      return ProxyLink.parseSocksHttp(text, 'socks5');
+    }
+    if (text.startsWith('http://') || text.startsWith('https://')) {
+      return ProxyLink.parseSocksHttp(text, 'http');
+    }
     throw new Error('不支持的链接：' + text.substring(0, 12));
   }
 
@@ -92,7 +99,7 @@ export class ProxyLink {
     return decoder.decodeToString(bytes);
   }
 
-  static splitUri(link: string, scheme: string): UriParts {
+  static splitUri(link: string, scheme: string, defaultPort: number = 443): UriParts {
     const parts = new UriParts();
     parts.scheme = scheme;
     let rest: string = link.substring(scheme.length + 3);
@@ -127,10 +134,10 @@ export class ProxyLink {
     if (colonIndex > 0) {
       parts.host = rest.substring(0, colonIndex);
       const portText: string = rest.substring(colonIndex + 1);
-      parts.port = portText.length > 0 ? Number.parseInt(portText) : 443;
+      parts.port = portText.length > 0 ? Number.parseInt(portText) : defaultPort;
     } else {
       parts.host = rest;
-      parts.port = 443;
+      parts.port = defaultPort;
     }
     parts.valid = parts.host.length > 0;
     return parts;
@@ -297,6 +304,39 @@ export class ProxyLink {
     return spec;
   }
 
+  /** socks5:// / socks:// / http:// / https:// 出站链接；userinfo 可为 user:pass 或仅 pass。 */
+  static parseSocksHttp(link: string, outType: string): ProxySpec {
+    const spec = new ProxySpec();
+    const lower: string = link.toLowerCase();
+    const isHttps: boolean = lower.startsWith('https://');
+    const scheme: string = outType === 'socks5'
+      ? (lower.startsWith('socks5://') ? 'socks5' : 'socks')
+      : (isHttps ? 'https' : 'http');
+    const defaultPort: number = outType === 'socks5' ? 1080 : (isHttps ? 443 : 80);
+    const parts: UriParts = ProxyLink.splitUri(link, scheme, defaultPort);
+    if (!parts.valid) {
+      throw new Error(outType + ' 链接格式错误');
+    }
+    spec.type = outType;
+    spec.server = parts.host;
+    spec.port = parts.port;
+    const colon: number = parts.userinfo.indexOf(':');
+    if (colon >= 0) {
+      spec.username = parts.userinfo.substring(0, colon);
+      spec.password = parts.userinfo.substring(colon + 1);
+    } else {
+      spec.password = parts.userinfo;
+    }
+    spec.tls = isHttps;
+    ProxyLink.applyQuery(spec, parts);
+    spec.name = parts.name.length > 0 ? parts.name : (spec.server + ':' + spec.port);
+    spec.link = link;
+    if (spec.server.length === 0) {
+      throw new Error(outType + ' 链接缺少服务器地址');
+    }
+    return spec;
+  }
+
   /** 把节点字段编码成 base64 字符串（vmess / ss 凭据用）。 */
   private static b64encode(text: string): string {
     const enc: util.TextEncoder = util.TextEncoder.create('utf-8');
@@ -362,6 +402,13 @@ export class ProxyLink {
     if (p.type === 'trojan') {
       return 'trojan://' + encodeURIComponent(p.password) + '@' + p.server + ':' +
         String(p.port) + ProxyLink.commonQuery(p) + '#' + name;
+    }
+    if (p.type === 'socks5' || p.type === 'http') {
+      const cred: string = p.username.length > 0
+        ? encodeURIComponent(p.username) + ':' + encodeURIComponent(p.password)
+        : encodeURIComponent(p.password);
+      const scheme: string = p.type === 'http' ? (p.tls ? 'https' : 'http') : 'socks5';
+      return scheme + '://' + cred + '@' + p.server + ':' + String(p.port) + '#' + name;
     }
     // vless（默认）
     return 'vless://' + encodeURIComponent(p.uuid) + '@' + p.server + ':' +

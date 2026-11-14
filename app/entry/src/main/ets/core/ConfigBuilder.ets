@@ -341,8 +341,16 @@ export class ConfigBuilder {
     } else if (profile.type === 'ss') {
       lines.push('    cipher: ' + ConfigBuilder.quote(profile.cipher));
       lines.push('    password: ' + ConfigBuilder.quote(profile.password));
+    } else if (profile.type === 'socks5' || profile.type === 'http') {
+      if (profile.username.length > 0) {
+        lines.push('    username: ' + ConfigBuilder.quote(profile.username));
+      }
+      if (profile.password.length > 0) {
+        lines.push('    password: ' + ConfigBuilder.quote(profile.password));
+      }
     }
 
+    if (profile.type !== 'socks5' && profile.type !== 'http') {
     if (profile.network === 'ws') {
       lines.push('    network: ws');
       lines.push('    ws-opts:');
@@ -367,6 +375,7 @@ export class ConfigBuilder {
         lines.push('      host:');
         lines.push('        - ' + ConfigBuilder.quote(profile.wsHost));
       }
+    }
     }
 
     if (profile.tls) {

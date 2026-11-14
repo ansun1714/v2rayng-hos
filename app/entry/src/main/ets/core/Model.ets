@@ -7,6 +7,7 @@ export class ProxySpec {
   server: string = '';
   port: number = 443;
   uuid: string = '';
+  username: string = '';  // socks5/http 出站的用户名
   password: string = '';
   cipher: string = '';   // ss 的加密方式 / vmess 的 scy
   alterId: number = 0;   // vmess 的 aid
@@ -36,6 +37,7 @@ export class Profile {
   server: string = '';
   port: number = 443;
   uuid: string = '';
+  username: string = '';  // socks5/http 出站的用户名
   password: string = '';
   cipher: string = '';
   alterId: number = 0;

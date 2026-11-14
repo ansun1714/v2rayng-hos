@@ -328,6 +328,7 @@ struct Index {
   @State eServer: string = '';
   @State ePort: string = '443';
   @State eUuid: string = '';
+  @State eUsername: string = '';
   @State ePassword: string = '';
   @State eCipher: string = '';
   @State eNetwork: string = 'ws';
@@ -2651,6 +2652,7 @@ struct Index {
     this.eServer = p.server;
     this.ePort = String(p.port);
     this.eUuid = p.uuid;
+    this.eUsername = p.username;
     this.ePassword = p.password;
     this.eCipher = p.cipher;
     this.eNetwork = p.network;
@@ -2671,6 +2673,7 @@ struct Index {
     this.eServer = '';
     this.ePort = '443';
     this.eUuid = '';
+    this.eUsername = '';
     this.ePassword = '';
     this.eCipher = '';
     this.eNetwork = 'ws';
@@ -2713,6 +2716,7 @@ struct Index {
     p.server = this.eServer.trim();
     p.port = port;
     p.uuid = this.eUuid.trim();
+    p.username = this.eUsername.trim();
     p.password = this.ePassword;
     p.cipher = this.eCipher.trim();
     p.network = this.eNetwork;
@@ -3971,6 +3975,8 @@ struct Index {
               this.chip('vmess', this.eType, () => { this.eType = 'vmess'; })
               this.chip('trojan', this.eType, () => { this.eType = 'trojan'; })
               this.chip('ss', this.eType, () => { this.eType = 'ss'; })
+              this.chip('socks5', this.eType, () => { this.eType = 'socks5'; })
+              this.chip('http', this.eType, () => { this.eType = 'http'; })
             }.layoutWeight(1)
           }.width('100%')
 
@@ -3984,6 +3990,10 @@ struct Index {
           }
           if (this.eType === 'ss') {
             this.field('加密方式', this.eCipher, (v: string) => { this.eCipher = v; })
+          }
+          if (this.eType === 'socks5' || this.eType === 'http') {
+            this.field('用户名', this.eUsername, (v: string) => { this.eUsername = v; })
+            this.field('密码', this.ePassword, (v: string) => { this.ePassword = v; })
           }
 
           Row({ space: 8 }) {
@@ -4397,7 +4407,7 @@ struct Index {
 
         Text('单条链接').fontSize(14).fontColor('#5A5A5A')
 
-        TextArea({ text: this.linkInput, placeholder: '粘贴 vmess:// vless:// ss:// trojan:// 链接，一行一个' })
+        TextArea({ text: this.linkInput, placeholder: '粘贴 vmess:// vless:// ss:// trojan:// socks5:// http:// 链接，一行一个' })
           .width('100%')
           .height(110)
           .fontSize(13)
