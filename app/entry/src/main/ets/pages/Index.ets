@@ -10,6 +10,7 @@ import { Profile, CoreState, DelayBody, DelayReq, DelayRes, RuleItem, AppScope, 
 import { ConfigBuilder } from '../core/ConfigBuilder';
 import { FileStore } from '../core/FileStore';
 import { KeepAliveManager } from '../core/KeepAliveManager';
+import { NgCore } from '../core/NgCore';
 
 const BUNDLE_NAME: string = 'com.maoxu.v2rayng';
 const EXT_ABILITY: string = 'VpnExtAbility';
@@ -736,8 +737,18 @@ struct Index {
     this.settings = FileStore.loadSettings(this.filesDir);
     // 订阅配额与到期信息（上次成功拉取时落盘）
     this.subQuota = FileStore.loadSubQuota(this.filesDir);
-    // 内核版本：扩展进程启动时写入，界面只读展示
+    // 内核版本：扩展进程启动时写入；首次连接前文件可能为空，这里直接调 NAPI 兜底读一次
     this.coreVersion = FileStore.readText(FileStore.coreVersionPath(this.filesDir)).trim();
+    if (this.coreVersion.length === 0) {
+      try {
+        const ver: string = NgCore.version();
+        if (ver.length > 0 && ver !== 'unknown') {
+          this.coreVersion = ver;
+          FileStore.writeText(FileStore.coreVersionPath(this.filesDir), ver);
+        }
+      } catch (err) {
+      }
+    }
   }
 
   seedDefaultNodes(): void {
