@@ -375,6 +375,38 @@ export class ConfigBuilder {
         lines.push('      host:');
         lines.push('        - ' + ConfigBuilder.quote(profile.wsHost));
       }
+    } else if (profile.network === 'mkcp' || profile.network === 'kcp') {
+      lines.push('    network: mkcp');
+      lines.push('    mkcp-opts:');
+      if (profile.kcpSeed.length > 0) {
+        lines.push('      seed: ' + ConfigBuilder.quote(profile.kcpSeed));
+      }
+      if (profile.kcpHeader.length > 0) {
+        lines.push('      header: ' + ConfigBuilder.quote(profile.kcpHeader));
+      }
+    } else if (profile.network === 'http') {
+      lines.push('    network: http');
+      lines.push('    http-opts:');
+      if (profile.wsPath.length > 0) {
+        lines.push('      path:');
+        lines.push('        - ' + ConfigBuilder.quote(profile.wsPath));
+      }
+      if (profile.wsHost.length > 0) {
+        lines.push('      host:');
+        lines.push('        - ' + ConfigBuilder.quote(profile.wsHost));
+      }
+    } else if (profile.network === 'xhttp') {
+      lines.push('    network: xhttp');
+      lines.push('    xhttp-opts:');
+      if (profile.wsPath.length > 0) {
+        lines.push('      path: ' + ConfigBuilder.quote(profile.wsPath));
+      }
+      if (profile.wsHost.length > 0) {
+        lines.push('      host: ' + ConfigBuilder.quote(profile.wsHost));
+      }
+      if (profile.xhttpMode.length > 0) {
+        lines.push('      mode: ' + ConfigBuilder.quote(profile.xhttpMode));
+      }
     }
     }
 

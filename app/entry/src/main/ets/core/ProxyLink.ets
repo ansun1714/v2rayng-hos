@@ -15,6 +15,7 @@ interface VmessJson {
   scy?: string;
   net?: string;
   type?: string;
+  seed?: string;
   host?: string;
   path?: string;
   tls?: string;
@@ -61,6 +62,9 @@ export class ProxyLink {
     p.realitySid = spec.realitySid;
     p.alpn = spec.alpn;
     p.allowInsecure = spec.allowInsecure;
+    p.kcpSeed = spec.kcpSeed;
+    p.kcpHeader = spec.kcpHeader;
+    p.xhttpMode = spec.xhttpMode;
     p.subId = subId;
     return p;
   }
@@ -168,6 +172,19 @@ export class ProxyLink {
     if (serviceName !== undefined) {
       spec.grpcService = serviceName;
     }
+    const seed: string | undefined = parts.query.get('seed');
+    if (seed !== undefined) {
+      spec.kcpSeed = seed;
+    }
+    const headerType: string | undefined = parts.query.get('headerType')
+      ?? parts.query.get('header-type') ?? parts.query.get('header');
+    if (headerType !== undefined) {
+      spec.kcpHeader = headerType;
+    }
+    const mode: string | undefined = parts.query.get('mode');
+    if (mode !== undefined) {
+      spec.xhttpMode = mode;
+    }
     const flow: string | undefined = parts.query.get('flow');
     if (flow !== undefined) {
       spec.flow = flow;
@@ -207,6 +224,9 @@ export class ProxyLink {
     spec.alterId = json.aid !== undefined ? Number.parseInt(json.aid) : 0;
     spec.cipher = (json.scy !== undefined && json.scy.length > 0) ? json.scy : 'auto';
     spec.network = json.net !== undefined ? json.net : 'tcp';
+    spec.kcpSeed = json.seed ?? '';
+    spec.kcpHeader = (spec.network === 'kcp' || spec.network === 'mkcp')
+      ? (json.type ?? '') : '';
     spec.tls = json.tls === 'tls';
     spec.sni = json.sni ?? '';
     spec.wsPath = json.path ?? '';
@@ -372,6 +392,16 @@ export class ProxyLink {
       add('host', p.wsHost);
     } else if (p.network === 'grpc') {
       add('serviceName', p.grpcService);
+    } else if (p.network === 'mkcp' || p.network === 'kcp') {
+      add('seed', p.kcpSeed);
+      add('headerType', p.kcpHeader);
+    } else if (p.network === 'http') {
+      add('path', p.wsPath);
+      add('host', p.wsHost);
+    } else if (p.network === 'xhttp') {
+      add('path', p.wsPath);
+      add('host', p.wsHost);
+      add('mode', p.xhttpMode);
     }
     add('flow', p.flow);
     return q.length > 0 ? '?' + q.join('&') : '';

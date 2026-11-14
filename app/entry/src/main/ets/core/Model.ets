@@ -23,6 +23,9 @@ export class ProxySpec {
   realitySid: string = '';
   alpn: string = '';       // TLS ALPN，逗号分隔，如 h2,http/1.1
   allowInsecure: boolean = false;
+  kcpSeed: string = '';    // mkcp/kcp 传输的 seed
+  kcpHeader: string = '';  // mkcp/kcp 伪装类型（headerType，如 srtp/utp/wechat-video）
+  xhttpMode: string = '';  // xhttp 模式（auto/stream-one/stream-up 等）
   link: string = '';
 }
 
@@ -53,6 +56,9 @@ export class Profile {
   realitySid: string = '';
   alpn: string = '';
   allowInsecure: boolean = false;
+  kcpSeed: string = '';
+  kcpHeader: string = '';
+  xhttpMode: string = '';
   delay: number = -1;   // 测速结果（毫秒），-1 未测/不通
   /** 延迟测速是否跑过：未测显示「—」，测过不通才显示红色 -1 */
   delayTested: boolean = false;
